@@ -4,19 +4,22 @@ from typing import Callable
 
 from ..pages import browser_resize_page
 from .nav import navbar
-from .side import sidebar
-from ..states import LoginState
+from ..components import logout_dialog, login_dialog, register_dialog
+# from ..states import LoginState
 
 
 def _page_shell(content: rx.Component) -> rx.Component:
     return rx.fragment(
         rx.desktop_only(
-            rx.cond(
-                LoginState.logged_in,
-                sidebar(),
-            ),
+            # rx.cond(
+            #     LoginState.logged_in,
+            #     sidebar(),
+            # ),
             # sidebar(),
             navbar(),
+            login_dialog(),
+            logout_dialog(),
+            register_dialog(),
             content,
             height="100vh",
             overflow="hidden",

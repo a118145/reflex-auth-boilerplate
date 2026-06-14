@@ -37,135 +37,66 @@ def sidebar_items() -> rx.Component:
 
 def sidebar() -> rx.Component:
     return rx.box(
-        rx.desktop_only(
+        rx.vstack(
+            rx.hstack(
+                rx.image(
+                    src="https://web.reflex-assets.dev/other/logo.jpg",
+                    width="2.25em",
+                    height="auto",
+                    border_radius="25%",
+                ),
+                rx.heading("Reflex", size="7", weight="bold"),
+                align="center",
+                justify="start",
+                padding_x="0.5rem",
+                width="100%",
+            ),
+            sidebar_items(),
+            rx.spacer(),
             rx.vstack(
-                rx.hstack(
-                    rx.image(
-                        src="https://web.reflex-assets.dev/other/logo.jpg",
-                        width="2.25em",
-                        height="auto",
-                        border_radius="25%",
-                    ),
-                    rx.heading("Reflex", size="7", weight="bold"),
-                    align="center",
-                    justify="start",
-                    padding_x="0.5rem",
+                rx.vstack(
+                    sidebar_item("Settings", "settings", "/#"),
+                    sidebar_item("Log out", "log-out", "/#"),
+                    spacing="1",
                     width="100%",
                 ),
-                sidebar_items(),
-                rx.spacer(),
-                rx.vstack(
-                    rx.vstack(
-                        sidebar_item("Settings", "settings", "/#"),
-                        sidebar_item("Log out", "log-out", "/#"),
-                        spacing="1",
-                        width="100%",
+                rx.divider(),
+                rx.hstack(
+                    rx.icon_button(
+                        rx.icon("user"), size="3", radius="full"
                     ),
-                    rx.divider(),
-                    rx.hstack(
-                        rx.icon_button(
-                            rx.icon("user"), size="3", radius="full"
-                        ),
-                        rx.vstack(
-                            rx.box(
-                                rx.text("My account", size="3", weight="bold"),
-                                rx.text(
-                                    "user@reflex.dev", size="2", weight="medium"
-                                ),
-                                width="100%",
+                    rx.vstack(
+                        rx.box(
+                            rx.text("My account", size="3", weight="bold"),
+                            rx.text(
+                                "user@reflex.dev", size="2", weight="medium"
                             ),
-                            spacing="0",
-                            align="start",
-                            justify="start",
                             width="100%",
                         ),
-                        padding_x="0.5rem",
-                        align="center",
+                        spacing="0",
+                        align="start",
                         justify="start",
                         width="100%",
                     ),
+                    padding_x="0.5rem",
+                    align="center",
+                    justify="start",
                     width="100%",
-                    spacing="5",
                 ),
+                width="100%",
                 spacing="5",
-                position="fixed",
-                # left="0px",
-                # top="0px",
-                # z_index="5",
-                padding_x="1em",
-                padding_y="1.5em",
-                bg=rx.color("accent", 3),
-                align="start",
-                height="100vh",
-                # height="650px",
-                width="16em",
             ),
-        ),
-        rx.mobile_and_tablet(
-            rx.drawer.root(
-                rx.drawer.trigger(rx.icon("align-justify", size=30)),
-                rx.drawer.overlay(z_index="5"),
-                rx.drawer.portal(
-                    rx.drawer.content(
-                        rx.vstack(
-                            rx.box(
-                                rx.drawer.close(rx.icon("x", size=30)),
-                                width="100%",
-                            ),
-                            sidebar_items(),
-                            rx.spacer(),
-                            rx.vstack(
-                                rx.vstack(
-                                    sidebar_item("Settings", "settings", "/#"),
-                                    sidebar_item("Log out", "log-out", "/#"),
-                                    width="100%",
-                                    spacing="1",
-                                ),
-                                rx.divider(margin="0"),
-                                rx.hstack(
-                                    rx.icon_button(
-                                        rx.icon("user"), size="3", radius="full"
-                                    ),
-                                    rx.vstack(
-                                        rx.box(
-                                            rx.text(
-                                                "My account",
-                                                size="3",
-                                                weight="bold",
-                                            ),
-                                            rx.text(
-                                                "user@reflex.dev",
-                                                size="2",
-                                                weight="medium",
-                                            ),
-                                            width="100%",
-                                        ),
-                                        spacing="0",
-                                        justify="start",
-                                        width="100%",
-                                    ),
-                                    padding_x="0.5rem",
-                                    align="center",
-                                    justify="start",
-                                    width="100%",
-                                ),
-                                width="100%",
-                                spacing="5",
-                            ),
-                            spacing="5",
-                            width="100%",
-                        ),
-                        top="auto",
-                        right="auto",
-                        height="100%",
-                        width="20em",
-                        padding="1.5em",
-                        bg=rx.color("accent", 2),
-                    ),
-                    width="100%",
-                ),
-                direction="left",
-            ),
-            padding="1em",
+            spacing="5",
+            position="fixed",
+            # left="0px",
+            # top="0px",
+            # z_index="5",
+            padding_x="1em",
+            padding_y="1.5em",
+            bg=rx.color("accent", 3),
+            align="start",
+            height="100vh",
+            # height="650px",
+            width="16em",
         ),
     )
