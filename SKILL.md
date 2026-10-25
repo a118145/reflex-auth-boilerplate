@@ -188,7 +188,8 @@ uv run reflex db migrate
   (`{{allowed_domains}}`, `{{mail_transport}}`, `{{app_name}}`) and append
   `.env` to `.gitignore`. Never write real secrets anywhere in the repo.
 - Append the block below the `---` in `references/conventions_auth.md` to
-  `AGENTS.md`, outside the `<!-- reflex managed -->` markers, with
+  `AGENTS.md`, after the scaffold's conventions block (outside the
+  `<!-- reflex managed -->` markers, if an older app still has them), with
   `{{app_name}}` filled.
 - Add an "Authentication" section to `README.md`: required env vars, how to
   create the admin hash (`uv run python -m {{app_name}}.auth.hash_password`),
@@ -206,6 +207,9 @@ uv run pytest -q
 uv run mypy .
 uv run ruff check . && uv run ruff format --check .
 ```
+
+Apps from current scaffold versions bundle these in `scripts/check.sh --full`
+(every line must read `ok`) and have `scripts/smoke.sh` for the runtime check.
 
 ### Apps from older scaffold versions
 
