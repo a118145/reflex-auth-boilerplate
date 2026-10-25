@@ -12,10 +12,10 @@ for the audit log only — callers show the same message for all of them.
 from __future__ import annotations
 
 import dataclasses
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Literal
 
-from sqlalchemy import ColumnElement, func, update
+from sqlalchemy import ColumnElement, delete, func, or_, update
 from sqlmodel import Session, col, select
 
 from ..utils.logging import get_logger
@@ -473,6 +473,38 @@ def merge_users(db: Session, source_id: int, target_id: int, *, actor_user_id: i
         detail=f"source={source_id} emails={len(moved)} sessions={revoked}",
     )
     db.commit()
+
+
+# --------------------------------------------------------------------------
+# Housekeeping
+
+
+def purge_expired(db: Session, older_than: timedelta) -> dict[str, int]:
+    """Delete auth rows that can no longer matter, once they are older than
+    ``older_than``: spent or expired links, ended or expired sessions, and
+    admin login attempts (the lockout window is far shorter). The audit log
+    and accounts are never touched. Returns the deleted counts per table."""
+    cutoff = now() - older_than
+    results = {
+        "links": db.exec(
+            delete(AuthLinkToken).where(
+                col(AuthLinkToken.created_at) < cutoff,
+                or_(col(AuthLinkToken.used_at).is_not(None), col(AuthLinkToken.expires_at) < now()),
+            )
+        ),
+        "sessions": db.exec(
+            delete(AuthSession).where(
+                or_(col(AuthSession.revoked_at) < cutoff, col(AuthSession.expires_at) < cutoff)
+            )
+        ),
+        "login_attempts": db.exec(
+            delete(AuthLoginAttempt).where(col(AuthLoginAttempt.created_at) < cutoff)
+        ),
+    }
+    db.commit()
+    counts = {name: int(result.rowcount) for name, result in results.items()}
+    log.info("auth.purge", **counts)
+    return counts
 
 
 # --------------------------------------------------------------------------

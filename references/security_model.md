@@ -139,9 +139,18 @@ docker compose / `.env` interpolation.
 
 `auth/service.py:audit()` writes `AuthAuditEvent` rows and a structlog event.
 Addresses without an account are stored only as a 16-hex-digit SHA-256
-prefix. Note: the scaffold's `utils/logging.py` routes structlog through the
-stdlib logger without configuring a handler, so `INFO` events are not
-printed by default — the database table is the reliable record.
+prefix. The audit table is never purged; deciding how long to keep it is
+the operator's call. (Apps from scaffold versions before the logging fix
+drop `INFO` events, so there only the table records them.)
+
+## Housekeeping
+
+`auth/housekeeping.py` is a Reflex lifespan task: at start and then every
+24 hours it deletes link tokens that are spent or expired, sessions that are
+revoked or expired, and admin login attempts — each only once older than
+`AUTH_PURGE_AFTER_DAYS` (30). Rows inside that window stay for the admin's
+session list and for forensics; the lockout window (15 min) is far shorter.
+A failed run is logged and retried the next day.
 
 ## Known limits
 

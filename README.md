@@ -20,6 +20,8 @@ created with the
   default, `@auth_event(auth=check)`, route checks, `/forbidden`, state reset
   on user change — without `reflex-enterprise`.
 - Mail via **Microsoft Graph**, **SMTP**, **Mailgun**, or console (dev).
+- A daily clean-up of spent links, ended sessions and old login attempts
+  (the audit log is kept).
 - The account block (address, log out, log out everywhere) at the end of the
   navigation in all three scaffold layouts.
 
@@ -44,7 +46,7 @@ Then, in a scaffold-generated app, ask Claude Code to add authentication.
 
 ## Verified against
 
-Reflex 0.9.8, sqlmodel 0.0.48. Applied to fresh scaffold apps in all six
+Reflex 0.9.8, sqlmodel 0.0.48, with the current reflex-app-scaffold. Applied to fresh scaffold apps in all six
 combinations (layouts `both`/`top`/`side` × database yes/no): ruff, mypy
 (strict) and the generated tests pass, and the app compiles without
 deprecation warnings. A 34-step browser test (sign-in, redirects, cookie
@@ -60,3 +62,7 @@ references/     security model, verified Reflex facts, deployment, AGENTS.md blo
 templates/      files copied into the app (auth/, pages, states, ui, tests)
 snippets/       exact insertions into the scaffold's files
 ```
+
+## License
+
+MIT — see [LICENSE](LICENSE).

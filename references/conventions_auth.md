@@ -20,6 +20,7 @@ Read `{{app_name}}/auth/__init__.py` for the module map.
 | `auth/state.py` | `AuthState` — the second state outside `states/` (like `NavState`). Written only by the middleware. |
 | `auth/policy.py` | `PUBLIC_ROUTES`, `ROUTE_CHECKS`, `auth_event`. **The one place access is declared.** |
 | `auth/authz.py` | Authorization checks, named for the question they answer. |
+| `auth/housekeeping.py` | Daily lifespan task purging dead links, sessions and login attempts. |
 | `auth/merge_hooks.py` | Re-points app tables when the admin merges two accounts. |
 | `states/admin_state.py` | The admin area's state. Every handler is `auth=is_admin`. |
 
