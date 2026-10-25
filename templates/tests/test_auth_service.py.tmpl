@@ -13,6 +13,7 @@ from {{app_name}}.auth.models import (
     AUTH_TABLES,
     AuthAuditEvent,
     AuthLinkToken,
+    AuthLoginAttempt,
     AuthSession,
     AuthUserEmail,
     now,
@@ -301,3 +302,37 @@ def test_audit_never_stores_an_address_in_clear(db: Session) -> None:
     for row in db.exec(select(AuthAuditEvent)).all():
         assert "@" not in row.email_hash + row.detail
     assert any(r.event == "auth.login" for r in service.list_audit(db))
+
+
+# --- housekeeping
+
+
+def test_purge_removes_only_dead_rows_past_the_cutoff(db: Session) -> None:
+    keep = sign_in(db, "anna@firma.de")
+    gone = sign_in(db, "bert@firma.de")
+    service.logout(db, gone, everywhere=False, client_ip=IP)
+    service.admin_login(db, ADMIN, "nope", client_ip=IP, user_agent="")
+    pending, _ = service.request_link(db, "carl@firma.de", client_ip=IP, redirect_to="/")
+    audit_before = len(db.exec(select(AuthAuditEvent)).all())
+
+    # Nothing is old enough yet.
+    assert service.purge_expired(db, timedelta(days=30)) == {
+        "links": 0,
+        "sessions": 0,
+        "login_attempts": 0,
+    }
+
+    # Age every row past the cutoff.
+    old = now() - timedelta(days=31)
+    db.exec(update(AuthLinkToken).values(created_at=old))
+    db.exec(
+        update(AuthSession).where(col(AuthSession.revoked_at).is_not(None)).values(revoked_at=old)
+    )
+    db.exec(update(AuthLoginAttempt).values(created_at=old))
+    db.commit()
+    counts = service.purge_expired(db, timedelta(days=30))
+
+    assert counts == {"links": 2, "sessions": 1, "login_attempts": 1}
+    assert service.resolve_session(db, keep) is not None  # live session kept
+    assert pending is not None and service.peek_link(db, pending)  # live link kept
+    assert len(db.exec(select(AuthAuditEvent)).all()) == audit_before  # audit log kept

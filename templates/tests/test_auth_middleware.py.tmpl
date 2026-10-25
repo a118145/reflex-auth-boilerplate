@@ -108,7 +108,10 @@ def test_public_page_loads_for_anonymous() -> None:
 def test_signed_in_page_load_passes() -> None:
     root = _new_root()
     assert (
-        _run(root, _event(PAGE_LOAD, route=routes.NOT_FOUND_ROUTE, path="/some/page", token="user-token"))
+        _run(
+            root,
+            _event(PAGE_LOAD, route=routes.NOT_FOUND_ROUTE, path="/some/page", token="user-token"),
+        )
         is None
     )
     auth = asyncio.run(root.get_state(AuthState))

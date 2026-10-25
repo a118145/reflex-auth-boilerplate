@@ -11,6 +11,7 @@ Module map:
 * ``security``   — token/password hashing, redirect validation, client IP
 * ``service``    — every database operation; plain functions over a Session
 * ``endpoints``  — backend HTTP routes that set and clear the session cookie
+* ``housekeeping`` — daily purge of dead links, sessions, login attempts
 * ``middleware`` — strips the cookie from router data and gates every event
 * ``policy``     — public routes, route checks, ``auth_event``
 * ``authz``      — the authorization checks themselves

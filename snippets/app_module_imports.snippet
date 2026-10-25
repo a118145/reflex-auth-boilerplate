@@ -1,3 +1,4 @@
 from .auth import models as auth_models  # registers the auth tables
 from .auth.endpoints import auth_api
+from .auth.housekeeping import purge_expired_daily
 from .auth.middleware import AuthMiddleware

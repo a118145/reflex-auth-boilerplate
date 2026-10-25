@@ -21,6 +21,7 @@ Defaults follow ``reflex-magic-link-auth`` (30 min links, 7 day sessions,
 | ``AUTH_ADMIN_MAX_FAILURES_PER_IP`` | 5 | Failed admin logins per IP per lockout window. |
 | ``AUTH_ADMIN_MAX_FAILURES_GLOBAL`` | 20 | Failed admin logins in total per lockout window. |
 | ``AUTH_ADMIN_LOCKOUT_SECONDS`` | 900 | The lockout window. |
+| ``AUTH_PURGE_AFTER_DAYS`` | 30 | Used/expired links, ended sessions and login attempts older than this are deleted daily. The audit log is kept. |
 | ``AUTH_TRUSTED_PROXIES`` | — | Comma-separated proxy IPs whose ``X-Forwarded-For`` is believed. |
 | ``MAIL_TRANSPORT`` | — | ``console`` (dev only), ``smtp``, ``mailgun`` or ``graph``. |
 | ``MAIL_FROM`` | — | Sender address (SMTP, Mailgun). Graph sends as ``GRAPH_SENDER``. |
@@ -86,6 +87,8 @@ if ADMIN_PASSWORD_HASH is not None and not ADMIN_PASSWORD_HASH.startswith("scryp
 ADMIN_MAX_FAILURES_PER_IP = _positive_int("AUTH_ADMIN_MAX_FAILURES_PER_IP", 5)
 ADMIN_MAX_FAILURES_GLOBAL = _positive_int("AUTH_ADMIN_MAX_FAILURES_GLOBAL", 20)
 ADMIN_LOCKOUT = _seconds("AUTH_ADMIN_LOCKOUT_SECONDS", 900)
+
+PURGE_AFTER = timedelta(days=_positive_int("AUTH_PURGE_AFTER_DAYS", 30))
 
 TRUSTED_PROXIES = _csv("AUTH_TRUSTED_PROXIES")
 
