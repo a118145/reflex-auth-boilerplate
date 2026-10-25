@@ -1,0 +1,171 @@
+"""The event gate, driven with a real root state and real event names.
+
+The database lookup is replaced, so these run without a database; the
+service tests cover what it returns.
+"""
+
+import asyncio
+from collections.abc import Iterator
+from typing import Any
+
+import pytest
+from reflex.event import Event
+from reflex.istate.data import RouterData
+from reflex.state import OnLoadInternalState, State, StateUpdate
+
+from {{app_name}} import {{app_name}} as app_module
+from {{app_name}}.auth import middleware, security
+from {{app_name}}.auth.cookie import COOKIE_NAME
+from {{app_name}}.auth.service import Identity
+from {{app_name}}.auth.state import AuthState
+from {{app_name}}.navigation import routes
+from {{app_name}}.states.admin_state import AdminState
+
+USER = Identity(session_id=1, user_id=7, email="anna@firma.de", is_admin=False)
+ADMIN = Identity(session_id=2, user_id=1, email="admin@firma.de", is_admin=True)
+SESSIONS = {"user-token": USER, "admin-token": ADMIN}
+
+
+@pytest.fixture(autouse=True)
+def fake_lookup(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    by_hash = {security.token_hash(k): v for k, v in SESSIONS.items()}
+    monkeypatch.setattr(middleware, "lookup_session", by_hash.get)
+    yield
+
+
+def _event(handler: str, *, route: str, path: str | None = None, token: str | None = None) -> Event:
+    """An event as the socket handler hands it over: ``pathname`` is the
+    matched route, ``asPath`` what the browser shows."""
+    cookie = "theme=dark" + (f"; {COOKIE_NAME}={token}" if token else "")
+    return Event(
+        name=handler,
+        router_data={
+            "headers": {"cookie": cookie, "origin": "http://localhost:3000"},
+            "pathname": route,
+            "asPath": path or route,
+        },
+        payload={},
+    )
+
+
+def _run(root: State, event: Event) -> StateUpdate | None:
+    """What Reflex does before calling the middleware, then the middleware."""
+    root.router_data = event.router_data
+    root.router = RouterData.from_router_data(event.router_data)
+    gate = app_module.app._middlewares[0]
+    out: StateUpdate | None = asyncio.run(gate.preprocess(app_module.app, root, event))
+    return out
+
+
+def _new_root() -> State:
+    # Reflex refuses direct instantiation unless told it is internal.
+    internal: dict[str, Any] = {"_reflex_internal_init": True}
+    return State(**internal)
+
+
+def _redirect_path(update: StateUpdate | None) -> str | None:
+    if update is None:
+        return None
+    for event in update.events:
+        if event.name == "_redirect":
+            return str(event.payload["path"])
+    return "<toast>"
+
+
+PAGE_LOAD = f"{OnLoadInternalState.get_full_name()}.on_load_internal"
+ADMIN_HANDLER = f"{AdminState.get_full_name()}.load_users"
+PUBLIC_HANDLER = f"{AuthState.get_full_name()}.reset_login_form"
+
+
+def test_cookie_is_stripped_and_flagged() -> None:
+    data = {"headers": {"cookie": f"a=1; {COOKIE_NAME}=secret; b=2"}}
+    assert middleware.take_session_cookie(data) == "secret"
+    assert data["headers"]["cookie"] == "a=1; b=2"
+    # A copy that was already stripped says nothing about the cookie.
+    assert middleware.take_session_cookie(data) is None
+    assert middleware.take_session_cookie({}) is None
+    assert middleware.take_session_cookie({"headers": {"cookie": "a=1"}}) == ""
+
+
+def test_router_never_carries_the_cookie() -> None:
+    root = _new_root()
+    _run(root, _event(PUBLIC_HANDLER, route=routes.LOGIN_ROUTE, token="user-token"))
+    assert "user-token" not in str(root.router)
+    assert "user-token" not in str(root.router_data)
+
+
+def test_anonymous_page_load_redirects_to_login_with_target() -> None:
+    root = _new_root()
+    update = _run(root, _event(PAGE_LOAD, route=routes.NOT_FOUND_ROUTE, path="/some/page"))
+    assert _redirect_path(update) == "/login?redirect_to=%2Fsome%2Fpage"
+
+
+def test_public_page_loads_for_anonymous() -> None:
+    root = _new_root()
+    assert _run(root, _event(PAGE_LOAD, route=routes.LOGIN_ROUTE, path="/login")) is None
+
+
+def test_signed_in_page_load_passes() -> None:
+    root = _new_root()
+    assert (
+        _run(root, _event(PAGE_LOAD, route=routes.NOT_FOUND_ROUTE, path="/some/page", token="user-token"))
+        is None
+    )
+    auth = asyncio.run(root.get_state(AuthState))
+    assert auth.is_authenticated and auth.user_email == USER.email
+
+
+def test_admin_page_forbidden_for_user_allowed_for_admin() -> None:
+    root = _new_root()
+    update = _run(
+        root, _event(PAGE_LOAD, route=routes.ADMIN_ROUTE, path="/admin", token="user-token")
+    )
+    assert _redirect_path(update) == routes.FORBIDDEN_ROUTE
+    root = _new_root()
+    assert (
+        _run(root, _event(PAGE_LOAD, route=routes.ADMIN_ROUTE, path="/admin", token="admin-token"))
+        is None
+    )
+
+
+def test_protected_handler_blocked_for_anonymous() -> None:
+    root = _new_root()
+    update = _run(root, _event(ADMIN_HANDLER, route=routes.HOME_ROUTE, path="/"))
+    assert _redirect_path(update) == routes.LOGIN_ROUTE
+
+
+def test_admin_handler_denied_for_user_with_toast() -> None:
+    """Hiding the admin UI is not enforcement: dispatching the event by hand
+    must still be refused."""
+    root = _new_root()
+    update = _run(
+        root, _event(ADMIN_HANDLER, route=routes.HOME_ROUTE, path="/", token="user-token")
+    )
+    assert _redirect_path(update) == "<toast>"
+
+
+def test_admin_handler_allowed_for_admin() -> None:
+    root = _new_root()
+    assert (
+        _run(
+            root,
+            _event(ADMIN_HANDLER, route=routes.ADMIN_ROUTE, path="/admin", token="admin-token"),
+        )
+        is None
+    )
+
+
+def test_public_handler_allowed_for_anonymous() -> None:
+    root = _new_root()
+    assert _run(root, _event(PUBLIC_HANDLER, route=routes.LOGIN_ROUTE, path="/login")) is None
+
+
+def test_states_reset_when_the_user_changes() -> None:
+    root = _new_root()
+    _run(root, _event(PAGE_LOAD, route=routes.ADMIN_ROUTE, path="/admin", token="admin-token"))
+    admin_state = asyncio.run(root.get_state(AdminState))
+    admin_state.merge_target_id = "42"
+    # Same tab, now without the cookie (signed out): data must not survive.
+    _run(root, _event(PAGE_LOAD, route=routes.LOGIN_ROUTE, path="/login"))
+    assert asyncio.run(root.get_state(AdminState)).merge_target_id == ""
+    assert not asyncio.run(root.get_state(AuthState)).is_authenticated

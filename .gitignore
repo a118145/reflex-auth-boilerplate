@@ -1,19 +1,2 @@
-.web
-assets/external/
-*.py[cod]
-*.db
-.states
-# Python-generated files
 __pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
-
-# Virtual environments
-.venv
-
-# Claude
-CLAUDE.md
-
+*.pyc

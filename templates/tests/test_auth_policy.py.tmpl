@@ -1,0 +1,59 @@
+"""Pins the public surface. Widening it must be a deliberate test change."""
+
+from reflex.config import get_config
+from reflex.page import DECORATED_PAGES
+
+from {{app_name}} import {{app_name}} as app_module  # noqa: F401  (registers pages and states)
+from {{app_name}}.auth import authz
+from {{app_name}}.auth.policy import PUBLIC_ROUTES, ROUTE_CHECKS, handler_policy
+from {{app_name}}.auth.state import AuthState
+from {{app_name}}.navigation import routes
+from {{app_name}}.states.admin_state import AdminState
+
+
+def _registered_routes() -> set[str]:
+    return {args["route"] for _, args in DECORATED_PAGES[get_config().app_name]}
+
+
+def test_public_routes_are_exactly_the_login_pages() -> None:
+    assert {routes.LOGIN_ROUTE, routes.ADMIN_LOGIN_ROUTE, routes.FORBIDDEN_ROUTE} == PUBLIC_ROUTES
+
+
+def test_public_routes_exist() -> None:
+    assert _registered_routes() >= PUBLIC_ROUTES
+
+
+def test_admin_routes_require_the_admin_check() -> None:
+    admin_routes = {
+        r
+        for r in _registered_routes()
+        if r == routes.ADMIN_ROUTE or r.startswith(routes.ADMIN_ROUTE + "/")
+    }
+    assert admin_routes == set(ROUTE_CHECKS)
+    assert all(check is authz.is_admin for check in ROUTE_CHECKS.values())
+
+
+def test_every_admin_handler_requires_the_admin_check() -> None:
+    handlers = {name: h for name, h in AdminState.event_handlers.items() if name != "setvar"}
+    assert handlers
+    for name, handler in handlers.items():
+        assert handler_policy(handler.fn) is authz.is_admin, name
+
+
+def test_only_auth_state_handlers_are_public() -> None:
+    """Every handler of every app state requires login, except the login form's."""
+    public: set[str] = set()
+    pending = [AuthState.get_root_state()]
+    while pending:
+        cls = pending.pop()
+        pending.extend(cls.get_substates())
+        if cls.__module__.split(".")[0] != "{{app_name}}":
+            continue
+        for name, handler in cls.event_handlers.items():
+            if handler_policy(handler.fn) is False:
+                public.add(f"{cls.__name__}.{name}")
+    assert public == {
+        "AuthState.leave_public_page",
+        "AuthState.request_link",
+        "AuthState.reset_login_form",
+    }

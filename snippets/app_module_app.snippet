@@ -1,0 +1,7 @@
+# Authentication: the /_auth HTTP routes set and clear the session cookie,
+# and AuthMiddleware gates every event. Index 0: the cookie must leave the
+# router data before anything else sees the state, and nothing may run ahead
+# of the gate. See auth/__init__.py.
+app = rx.App(api_transformer=auth_api())
+app.add_middleware(AuthMiddleware(), index=0)
+log.info("auth.enabled", tables=len(auth_models.AUTH_TABLES))

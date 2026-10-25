@@ -1,0 +1,11 @@
+    {
+        "label": "Admin",
+        "icon": "shield",
+        "route": routes.ADMIN_ROUTE,
+        "admin_only": True,
+        "sub_items": [
+            {"label": "Users", "icon": "users", "route": routes.ADMIN_ROUTE},
+            {"label": "Sessions", "icon": "key-round", "route": routes.ADMIN_SESSIONS_ROUTE},
+            {"label": "Audit log", "icon": "scroll-text", "route": routes.ADMIN_AUDIT_ROUTE},
+        ],
+    },
