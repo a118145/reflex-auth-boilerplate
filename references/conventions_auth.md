@@ -1,8 +1,9 @@
 # Auth conventions block for generated apps
 
-Append everything below the line to the app's `AGENTS.md`, after the block
-from reflex-app-scaffold and **outside** the `<!-- reflex managed -->`
-markers. Replace `{{app_name}}`.
+Append everything below the line to the app's `AGENTS.md`, after the
+conventions block from reflex-app-scaffold. Replace `{{app_name}}`. (Apps from
+older scaffold versions still have `<!-- reflex managed -->` markers from
+`reflex init`: append outside them, `reflex init` rewrites the inside.)
 
 ---
 
