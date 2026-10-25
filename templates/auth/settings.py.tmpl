@@ -1,0 +1,101 @@
+"""Auth configuration from the environment.
+
+Read once at import. A variable that is set but unusable raises ``ValueError``
+instead of falling back to a default: these values bound how long a credential
+lives and how often one can be requested, so a typo must stop the app rather
+than quietly weaken it. An empty string means "not set".
+
+Defaults follow ``reflex-magic-link-auth`` (30 min links, 7 day sessions,
+5 links per window), which this implementation replaces.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| ``AUTH_ALLOWED_DOMAINS`` | — | Comma-separated e-mail domains that may request a link. Empty disables magic links. |
+| ``AUTH_LINK_EXPIRATION_SECONDS`` | 1800 | Lifetime of a link, and the rate-limit window. |
+| ``AUTH_SESSION_EXPIRATION_SECONDS`` | 604800 | Lifetime of a session. |
+| ``AUTH_LINK_RATE_LIMIT`` | 5 | Links per address per window. |
+| ``AUTH_LINK_RATE_LIMIT_PER_IP`` | 5 | Links per client IP per window. Raise it when many users share one IP (an office behind NAT). |
+| ``AUTH_SESSION_RECHECK_SECONDS`` | 60 | How stale a session check may be before an event re-reads the database. |
+| ``ADMIN_EMAIL`` | — | The admin account. Signs in with a password only. |
+| ``ADMIN_PASSWORD_HASH`` | — | Output of ``python -m <app>.auth.hash_password``. |
+| ``AUTH_ADMIN_MAX_FAILURES_PER_IP`` | 5 | Failed admin logins per IP per lockout window. |
+| ``AUTH_ADMIN_MAX_FAILURES_GLOBAL`` | 20 | Failed admin logins in total per lockout window. |
+| ``AUTH_ADMIN_LOCKOUT_SECONDS`` | 900 | The lockout window. |
+| ``AUTH_TRUSTED_PROXIES`` | — | Comma-separated proxy IPs whose ``X-Forwarded-For`` is believed. |
+| ``MAIL_TRANSPORT`` | — | ``console`` (dev only), ``smtp``, ``mailgun`` or ``graph``. |
+| ``MAIL_FROM`` | — | Sender address (SMTP, Mailgun). Graph sends as ``GRAPH_SENDER``. |
+
+Transport-specific variables are documented in ``mail/``.
+"""
+
+from __future__ import annotations
+
+import os
+from datetime import timedelta
+
+APP_TITLE = "{{app_title}}"
+
+
+def _env(name: str) -> str | None:
+    return (os.environ.get(name) or "").strip() or None
+
+
+def _positive_int(name: str, default: int) -> int:
+    value = _env(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise ValueError(f"{name} must be an integer, got {value!r}") from None
+    if parsed < 1:
+        raise ValueError(f"{name} must be at least 1, got {parsed}")
+    return parsed
+
+
+def _seconds(name: str, default: int) -> timedelta:
+    return timedelta(seconds=_positive_int(name, default))
+
+
+def _csv(name: str) -> frozenset[str]:
+    return frozenset(p.strip().lower() for p in (_env(name) or "").split(",") if p.strip())
+
+
+def _domains() -> frozenset[str]:
+    domains = _csv("AUTH_ALLOWED_DOMAINS")
+    for domain in domains:
+        if "@" in domain or "." not in domain:
+            raise ValueError(f"AUTH_ALLOWED_DOMAINS entries must be bare domains, got {domain!r}")
+    return domains
+
+
+ALLOWED_DOMAINS = _domains()
+LINK_EXPIRATION = _seconds("AUTH_LINK_EXPIRATION_SECONDS", 1800)
+SESSION_EXPIRATION = _seconds("AUTH_SESSION_EXPIRATION_SECONDS", 604800)
+LINK_RATE_LIMIT = _positive_int("AUTH_LINK_RATE_LIMIT", 5)
+LINK_RATE_LIMIT_PER_IP = _positive_int("AUTH_LINK_RATE_LIMIT_PER_IP", 5)
+SESSION_RECHECK = _seconds("AUTH_SESSION_RECHECK_SECONDS", 60)
+
+ADMIN_EMAIL = (_env("ADMIN_EMAIL") or "").lower() or None
+ADMIN_PASSWORD_HASH = _env("ADMIN_PASSWORD_HASH")
+if (ADMIN_EMAIL is None) != (ADMIN_PASSWORD_HASH is None):
+    raise ValueError("Set ADMIN_EMAIL and ADMIN_PASSWORD_HASH together, or neither.")
+if ADMIN_PASSWORD_HASH is not None and not ADMIN_PASSWORD_HASH.startswith("scrypt:"):
+    raise ValueError("ADMIN_PASSWORD_HASH must come from `python -m <app>.auth.hash_password`.")
+
+ADMIN_MAX_FAILURES_PER_IP = _positive_int("AUTH_ADMIN_MAX_FAILURES_PER_IP", 5)
+ADMIN_MAX_FAILURES_GLOBAL = _positive_int("AUTH_ADMIN_MAX_FAILURES_GLOBAL", 20)
+ADMIN_LOCKOUT = _seconds("AUTH_ADMIN_LOCKOUT_SECONDS", 900)
+
+TRUSTED_PROXIES = _csv("AUTH_TRUSTED_PROXIES")
+
+MAIL_TRANSPORT = (_env("MAIL_TRANSPORT") or "").lower() or None
+if MAIL_TRANSPORT not in (None, "console", "smtp", "mailgun", "graph"):
+    raise ValueError(
+        f"MAIL_TRANSPORT must be console, smtp, mailgun or graph, got {MAIL_TRANSPORT!r}"
+    )
+if MAIL_TRANSPORT == "console" and os.environ.get("REFLEX_ENV_MODE", "dev") == "prod":
+    raise ValueError(
+        "MAIL_TRANSPORT=console writes sign-in links to the log; it is refused in prod."
+    )
+MAIL_FROM = _env("MAIL_FROM")

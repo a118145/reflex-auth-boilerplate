@@ -1,0 +1,39 @@
+"""Shared chrome for the admin pages."""
+
+import reflex as rx
+
+from ..navigation import routes
+
+# True only in the top-bar-only layout, whose menu shows one "Admin" entry and
+# no sub-pages; the sidebar layouts list the admin pages in the menu instead.
+SHOW_ADMIN_SUBNAV = {{show_admin_subnav}}
+
+_PAGES = [
+    ("Users", "users", routes.ADMIN_ROUTE),
+    ("Sessions", "key-round", routes.ADMIN_SESSIONS_ROUTE),
+    ("Audit log", "scroll-text", routes.ADMIN_AUDIT_ROUTE),
+]
+
+
+def _subnav() -> rx.Component:
+    return rx.hstack(
+        *[
+            rx.link(rx.button(rx.icon(icon, size=14), label, variant="soft", size="1"), href=route)
+            for label, icon, route in _PAGES
+        ],
+        spacing="2",
+    )
+
+
+def admin_page(title: str, *children: rx.Component) -> rx.Component:
+    return rx.vstack(
+        rx.heading(title, size="7"),
+        _subnav() if SHOW_ADMIN_SUBNAV else rx.fragment(),
+        *children,
+        spacing="4",
+        width="100%",
+    )
+
+
+def muted(text: rx.Var[str] | str) -> rx.Component:
+    return rx.text(text, size="1", color_scheme="gray")

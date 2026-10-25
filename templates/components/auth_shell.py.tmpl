@@ -1,0 +1,43 @@
+"""Chrome for the public auth pages: no navigation, just a centred card.
+
+Deliberately not ``ui.base.base_page`` — the public pages must not show the
+app's menu or the account block to someone who is not signed in.
+"""
+
+import reflex as rx
+
+from ..auth.settings import APP_TITLE
+
+# Shown on the landing (login) page. LOGO is a path under assets/ such as
+# "/logo.svg", or None for the default icon.
+SLOGAN = {{slogan}}
+LOGO: str | None = {{logo}}
+
+
+def auth_shell(*children: rx.Component) -> rx.Component:
+    return rx.center(
+        rx.card(
+            rx.vstack(*children, spacing="4", align="center", width="100%"),
+            size="4",
+            width="100%",
+            max_width="26rem",
+        ),
+        min_height="100vh",
+        padding="1.5em",
+        background=rx.color("accent", 2),
+    )
+
+
+def brand() -> rx.Component:
+    mark = (
+        rx.image(src=LOGO, height="4rem", alt=APP_TITLE)
+        if LOGO
+        else rx.icon("box", size=48, color=rx.color("accent", 10))
+    )
+    return rx.vstack(
+        mark,
+        rx.heading(APP_TITLE, size="6", text_align="center"),
+        rx.text(SLOGAN, size="3", color_scheme="gray", text_align="center"),
+        spacing="2",
+        align="center",
+    )

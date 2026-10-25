@@ -1,0 +1,75 @@
+"""Pure helpers: redirect validation, client IP, password hashing, addresses."""
+
+import pytest
+
+from {{app_name}}.auth import security, settings
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["/", "/data", "/data/5?tab=2", "/a/b#c"],
+)
+def test_same_origin_paths_are_kept(target: str) -> None:
+    assert security.safe_redirect_path(target, "/fallback") == target
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        None,
+        "",
+        "data",
+        "//evil.test",
+        "/\\evil.test",
+        "https://evil.test/x",
+        "http:/evil.test",
+        "javascript:alert(1)",
+        "/ok\r\nSet-Cookie: x=y",
+        "/_auth/logout",
+        "/_auth",
+    ],
+)
+def test_everything_else_falls_back(target: str | None) -> None:
+    assert security.safe_redirect_path(target, "/fallback") == "/fallback"
+
+
+def test_forwarded_for_is_ignored_without_trusted_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "TRUSTED_PROXIES", frozenset())
+    assert security.client_ip("10.0.0.1", "1.2.3.4") == "10.0.0.1"
+
+
+def test_forwarded_for_is_walked_from_the_right(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "TRUSTED_PROXIES", frozenset({"10.0.0.1", "10.0.0.2"}))
+    # The client prepended a fake hop; the first untrusted hop from the right wins.
+    assert security.client_ip("10.0.0.1", "6.6.6.6, 1.2.3.4, 10.0.0.2") == "1.2.3.4"
+    assert security.client_ip("10.0.0.1", "not-an-ip") == "10.0.0.1"
+
+
+def test_password_hash_round_trip() -> None:
+    encoded = security.hash_password("correct horse battery")
+    assert encoded.startswith("scrypt:")
+    assert "$" not in encoded  # survives docker compose / .env interpolation
+    assert security.verify_password("correct horse battery", encoded)
+    assert not security.verify_password("wrong", encoded)
+    assert not security.verify_password("x", "garbage")
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (" Anna@Firma.DE ", "anna@firma.de"),
+        ("anna@firma", None),
+        ("@firma.de", None),
+        ("an na@firma.de", None),
+        ("", None),
+    ],
+)
+def test_normalize_email(raw: str, expected: str | None) -> None:
+    assert security.normalize_email(raw) == expected
+
+
+def test_domain_allowlist_is_exact(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "ALLOWED_DOMAINS", frozenset({"firma.de"}))
+    assert security.domain_allowed("anna@firma.de")
+    assert not security.domain_allowed("anna@sub.firma.de")
+    assert not security.domain_allowed("anna@firma.de.evil.test")

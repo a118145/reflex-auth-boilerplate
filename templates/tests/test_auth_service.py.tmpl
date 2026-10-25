@@ -1,0 +1,303 @@
+"""Auth service against a real, throwaway SQLite database."""
+
+from collections.abc import Iterator
+from datetime import timedelta
+from pathlib import Path
+
+import pytest
+from sqlalchemy import update
+from sqlmodel import Session, SQLModel, col, create_engine, select
+
+from {{app_name}}.auth import merge_hooks, security, service, settings
+from {{app_name}}.auth.models import (
+    AUTH_TABLES,
+    AuthAuditEvent,
+    AuthLinkToken,
+    AuthSession,
+    AuthUserEmail,
+    now,
+)
+
+ADMIN = "admin@firma.de"
+ADMIN_PASSWORD = "correct horse battery"
+IP = "192.0.2.10"
+
+
+@pytest.fixture(scope="module")
+def admin_hash() -> str:
+    return security.hash_password(ADMIN_PASSWORD)
+
+
+@pytest.fixture
+def db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, admin_hash: str) -> Iterator[Session]:
+    monkeypatch.setattr(settings, "ALLOWED_DOMAINS", frozenset({"firma.de"}))
+    monkeypatch.setattr(settings, "ADMIN_EMAIL", ADMIN)
+    monkeypatch.setattr(settings, "ADMIN_PASSWORD_HASH", admin_hash)
+    monkeypatch.setattr(settings, "LINK_RATE_LIMIT", 5)
+    monkeypatch.setattr(settings, "LINK_RATE_LIMIT_PER_IP", 5)
+    engine = create_engine(f"sqlite:///{tmp_path / 'auth.db'}")
+    # Filtered create_all: only the auth tables, never every registered model.
+    tables = [SQLModel.metadata.tables[t.__name__.lower()] for t in AUTH_TABLES]
+    SQLModel.metadata.create_all(engine, tables=tables)
+    with Session(engine) as session:
+        yield session
+    engine.dispose()
+
+
+def sign_in(db: Session, email: str, redirect_to: str = "/") -> str:
+    token, outcome = service.request_link(db, email, client_ip=IP, redirect_to=redirect_to)
+    assert outcome == "sent" and token is not None
+    result = service.redeem_link(db, token, client_ip=IP, user_agent="pytest")
+    assert result is not None
+    return security.token_hash(result[0])
+
+
+def admin_sign_in(db: Session) -> str:
+    token, outcome = service.admin_login(
+        db, ADMIN, ADMIN_PASSWORD, client_ip=IP, user_agent="pytest"
+    )
+    assert outcome == "ok" and token is not None
+    return security.token_hash(token)
+
+
+def user_id(db: Session, token_hash: str) -> int:
+    identity = service.resolve_session(db, token_hash)
+    assert identity is not None
+    return identity.user_id
+
+
+# --- magic links
+
+
+def test_link_signs_in_and_creates_the_account_once(db: Session) -> None:
+    assert db.exec(select(AuthUserEmail)).first() is None  # requesting creates nothing
+    first = sign_in(db, "Anna@Firma.de", "/data")
+    second = sign_in(db, "anna@firma.de")
+    assert user_id(db, first) == user_id(db, second)
+    assert len(db.exec(select(AuthUserEmail)).all()) == 1
+
+
+def test_redirect_target_survives_the_round_trip(db: Session) -> None:
+    token, _ = service.request_link(db, "anna@firma.de", client_ip=IP, redirect_to="/data/7")
+    assert token is not None
+    result = service.redeem_link(db, token, client_ip=IP, user_agent="")
+    assert result is not None and result[1] == "/data/7"
+
+
+def test_link_is_single_use(db: Session) -> None:
+    token, _ = service.request_link(db, "anna@firma.de", client_ip=IP, redirect_to="/")
+    assert token is not None
+    assert service.peek_link(db, token)  # peeking spends nothing
+    assert service.peek_link(db, token)
+    assert service.redeem_link(db, token, client_ip=IP, user_agent="") is not None
+    assert not service.peek_link(db, token)
+    assert service.redeem_link(db, token, client_ip=IP, user_agent="") is None
+
+
+def test_new_link_kills_the_previous_one(db: Session) -> None:
+    old, _ = service.request_link(db, "anna@firma.de", client_ip=IP, redirect_to="/")
+    new, _ = service.request_link(db, "anna@firma.de", client_ip=IP, redirect_to="/")
+    assert old is not None and new is not None
+    assert service.redeem_link(db, old, client_ip=IP, user_agent="") is None
+    assert service.redeem_link(db, new, client_ip=IP, user_agent="") is not None
+
+
+def test_expired_link_is_refused(db: Session) -> None:
+    token, _ = service.request_link(db, "anna@firma.de", client_ip=IP, redirect_to="/")
+    assert token is not None
+    db.exec(update(AuthLinkToken).values(expires_at=now() - timedelta(seconds=1)))
+    db.commit()
+    assert service.redeem_link(db, token, client_ip=IP, user_agent="") is None
+
+
+@pytest.mark.parametrize(
+    ("email", "outcome"),
+    [
+        ("not an address", "invalid_address"),
+        ("eve@evil.test", "domain_not_allowed"),
+        ("eve@sub.firma.de", "domain_not_allowed"),
+        (ADMIN, "admin_address"),
+    ],
+)
+def test_refused_requests_issue_no_token(db: Session, email: str, outcome: str) -> None:
+    token, got = service.request_link(db, email, client_ip=IP, redirect_to="/")
+    assert (token, got) == (None, outcome)
+
+
+def test_rate_limit_per_address_and_per_ip(db: Session) -> None:
+    for _ in range(settings.LINK_RATE_LIMIT):
+        assert service.request_link(db, "anna@firma.de", client_ip=IP, redirect_to="/")[1] == "sent"
+    assert (
+        service.request_link(db, "anna@firma.de", client_ip="198.51.100.1", redirect_to="/")[1]
+        == "rate_limited"
+    )
+    # Same IP, other address: the per-IP limit is exhausted too.
+    assert (
+        service.request_link(db, "bert@firma.de", client_ip=IP, redirect_to="/")[1]
+        == "rate_limited"
+    )
+
+
+def test_link_issued_before_domain_was_removed_is_refused(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token, _ = service.request_link(db, "anna@firma.de", client_ip=IP, redirect_to="/")
+    assert token is not None
+    monkeypatch.setattr(settings, "ALLOWED_DOMAINS", frozenset({"other.de"}))
+    assert service.redeem_link(db, token, client_ip=IP, user_agent="") is None
+
+
+# --- admin password
+
+
+def test_admin_login_and_admin_flag(db: Session) -> None:
+    identity = service.resolve_session(db, admin_sign_in(db))
+    assert identity is not None and identity.is_admin
+
+
+def test_magic_link_session_is_never_admin(db: Session) -> None:
+    identity = service.resolve_session(db, sign_in(db, "anna@firma.de"))
+    assert identity is not None and not identity.is_admin
+
+
+def test_admin_address_gets_no_link_even_after_admin_exists(db: Session) -> None:
+    admin_sign_in(db)
+    assert service.request_link(db, ADMIN, client_ip=IP, redirect_to="/")[1] == "admin_address"
+
+
+def test_wrong_password_and_unknown_address_look_alike(db: Session) -> None:
+    assert service.admin_login(db, ADMIN, "nope", client_ip=IP, user_agent="")[1] == "invalid"
+    assert (
+        service.admin_login(db, "who@firma.de", ADMIN_PASSWORD, client_ip=IP, user_agent="")[1]
+        == "invalid"
+    )
+
+
+def test_lockout_per_ip_then_global(db: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "ADMIN_MAX_FAILURES_PER_IP", 2)
+    monkeypatch.setattr(settings, "ADMIN_MAX_FAILURES_GLOBAL", 3)
+    for _ in range(2):
+        service.admin_login(db, ADMIN, "nope", client_ip=IP, user_agent="")
+    # Locked for this IP even with the right password.
+    assert (
+        service.admin_login(db, ADMIN, ADMIN_PASSWORD, client_ip=IP, user_agent="")[1] == "locked"
+    )
+    assert (
+        service.admin_login(db, ADMIN, "nope", client_ip="198.51.100.2", user_agent="")[1]
+        == "invalid"
+    )
+    # Three failures overall: locked everywhere.
+    assert (
+        service.admin_login(db, ADMIN, ADMIN_PASSWORD, client_ip="198.51.100.3", user_agent="")[1]
+        == "locked"
+    )
+
+
+def test_admin_login_disabled_without_configuration(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "ADMIN_EMAIL", None)
+    monkeypatch.setattr(settings, "ADMIN_PASSWORD_HASH", None)
+    assert (
+        service.admin_login(db, ADMIN, ADMIN_PASSWORD, client_ip=IP, user_agent="")[1] == "disabled"
+    )
+
+
+# --- sessions
+
+
+def test_logout_ends_one_session_logout_everywhere_ends_all(db: Session) -> None:
+    a, b, c = (sign_in(db, "anna@firma.de") for _ in range(3))
+    service.logout(db, a, everywhere=False, client_ip=IP)
+    assert service.resolve_session(db, a) is None
+    assert service.resolve_session(db, b) is not None
+    service.logout(db, b, everywhere=True, client_ip=IP)
+    assert service.resolve_session(db, b) is None
+    assert service.resolve_session(db, c) is None
+
+
+def test_expired_session_does_not_resolve(db: Session) -> None:
+    token_hash = sign_in(db, "anna@firma.de")
+    db.exec(update(AuthSession).values(expires_at=now() - timedelta(seconds=1)))
+    db.commit()
+    assert service.resolve_session(db, token_hash) is None
+
+
+def test_admin_revokes_a_session(db: Session) -> None:
+    admin_id = user_id(db, admin_sign_in(db))
+    token_hash = sign_in(db, "anna@firma.de")
+    identity = service.resolve_session(db, token_hash)
+    assert identity is not None
+    service.revoke_session(db, identity.session_id, actor_user_id=admin_id)
+    assert service.resolve_session(db, token_hash) is None
+
+
+# --- block
+
+
+def test_block_ends_sessions_and_stops_links(db: Session) -> None:
+    admin_id = user_id(db, admin_sign_in(db))
+    token_hash = sign_in(db, "anna@firma.de")
+    anna = user_id(db, token_hash)
+    service.set_blocked(db, anna, True, actor_user_id=admin_id)
+    assert service.resolve_session(db, token_hash) is None
+    assert (
+        service.request_link(db, "anna@firma.de", client_ip="198.51.100.9", redirect_to="/")[1]
+        == "blocked"
+    )
+    service.set_blocked(db, anna, False, actor_user_id=admin_id)
+    sign_in(db, "anna@firma.de")
+
+
+def test_admin_account_cannot_be_blocked(db: Session) -> None:
+    admin_id = user_id(db, admin_sign_in(db))
+    with pytest.raises(service.AdminActionError):
+        service.set_blocked(db, admin_id, True, actor_user_id=admin_id)
+
+
+# --- merge
+
+
+def test_merge_moves_addresses_and_signs_both_out(db: Session) -> None:
+    admin_id = user_id(db, admin_sign_in(db))
+    old = sign_in(db, "anna.alt@firma.de")
+    new = sign_in(db, "anna.neu@firma.de")
+    source, target = user_id(db, old), user_id(db, new)
+    seen: list[tuple[int, int]] = []
+    merge_hooks.MERGE_HOOKS.append(lambda _db, s, t: seen.append((s, t)))
+    try:
+        service.merge_users(db, source, target, actor_user_id=admin_id)
+    finally:
+        merge_hooks.MERGE_HOOKS.pop()
+    assert seen == [(source, target)]
+    assert service.resolve_session(db, old) is None and service.resolve_session(db, new) is None
+    # Either address now signs in to the surviving account.
+    assert user_id(db, sign_in(db, "anna.alt@firma.de")) == target
+    assert user_id(db, sign_in(db, "anna.neu@firma.de")) == target
+    events = db.exec(
+        select(AuthAuditEvent).where(col(AuthAuditEvent.event) == "admin.users_merged")
+    ).all()
+    assert len(events) == 1 and events[0].subject_user_id == target
+
+
+@pytest.mark.parametrize("which", ["same", "admin", "blocked"])
+def test_merge_refusals(db: Session, which: str) -> None:
+    admin_id = user_id(db, admin_sign_in(db))
+    a = user_id(db, sign_in(db, "a@firma.de"))
+    b = user_id(db, sign_in(db, "b@firma.de"))
+    if which == "blocked":
+        service.set_blocked(db, b, True, actor_user_id=admin_id)
+    source, target = {"same": (a, a), "admin": (a, admin_id), "blocked": (a, b)}[which]
+    with pytest.raises(service.AdminActionError):
+        service.merge_users(db, source, target, actor_user_id=admin_id)
+
+
+# --- audit
+
+
+def test_audit_never_stores_an_address_in_clear(db: Session) -> None:
+    sign_in(db, "anna@firma.de")
+    service.request_link(db, "eve@evil.test", client_ip=IP, redirect_to="/")
+    for row in db.exec(select(AuthAuditEvent)).all():
+        assert "@" not in row.email_hash + row.detail
+    assert any(r.event == "auth.login" for r in service.list_audit(db))
