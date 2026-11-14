@@ -107,6 +107,9 @@ Four layers, each with one job:
    needs both.
 5. **Protected data is loaded only by protected handlers**, and state has
    presentable defaults — that is what a signed-out client holds.
+6. **Every way a page opens goes through the gate** — first load,
+   client-side navigation, reconnect — whether or not the page loads data.
+   A gate hooked to "the page's load handler" misses pages that have none.
 
 ## 4. The service is the gate
 
@@ -212,6 +215,8 @@ Ask these of any change to a multi-user app:
 - Does any new value in client state, a URL, a log or an error message
   derive from a secret? (1.1, 7.1)
 - Is a new page or handler public? Is that in the pinned list? (3.1)
+- After a framework upgrade: is every way a page opens, and every way a
+  handler is reached, still behind the gate? (1.3, 3.6)
 - Does a new handler carry the named check for what it changes, and does the
   use case it calls check again with the actor's id? (3.2, 4.1)
 - Does a new read go through a function that takes the viewer? (4.2)

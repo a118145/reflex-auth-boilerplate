@@ -54,7 +54,7 @@ _SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "Content-Security-Policy": (
         "default-src 'none'; style-src 'unsafe-inline'; "
-        f"form-action 'self' {origin_of(get_config().deploy_url)}; "
+        f"form-action 'self' {origin_of(get_config().frontend_url)}; "
         "frame-ancestors 'none'; base-uri 'none'"
     ),
 }

@@ -1,6 +1,6 @@
 ---
 name: reflex-auth-boilerplate
-description: Turn a Reflex app into a secure multi-user app — sign-in (magic link with e-mail domain allowlist, admin password login), secure-by-default authorization, an admin area (sessions, blocking, merging and deleting accounts, groups, audit log), and a service layer in which every use case takes the acting user and enforces ownership and sharing (with a person, a group, everyone). Use when the user wants login, authentication, access protection, user accounts, per-user data, sharing, groups or roles in an app created with reflex-app-scaffold, or wants to build or review any app where several users sign in — references/architecture.md is the framework-neutral design and review checklist. The templates target scaffold apps on Reflex 0.10.1; not for OIDC/SSO.
+description: Turn a Reflex app into a secure multi-user app — sign-in (magic link with e-mail domain allowlist, admin password login), secure-by-default authorization, an admin area (sessions, blocking, merging and deleting accounts, groups, audit log), and a service layer in which every use case takes the acting user and enforces ownership and sharing (with a person, a group, everyone). Use when the user wants login, authentication, access protection, user accounts, per-user data, sharing, groups or roles in an app created with reflex-app-scaffold, or wants to build or review any app where several users sign in — references/architecture.md is the framework-neutral design and review checklist. The templates target scaffold apps on Reflex 0.11.0; not for OIDC/SSO.
 ---
 
 # Secure multi-user apps (Reflex auth boilerplate)
@@ -44,7 +44,7 @@ The result of applying it:
 | --- | --- |
 | `references/architecture.md` | The rules and why — the design every later change must keep. |
 | `references/security_model.md` | How Reflex implements them; known limits. |
-| `references/reflex_auth_facts.md` | Verified Reflex 0.10.1 behaviour the code rests on. Several obvious approaches leak the session token or do not work. |
+| `references/reflex_auth_facts.md` | Verified Reflex 0.11.0 behaviour the code rests on, and what changed from 0.10.1. Several obvious approaches leak the session token or do not work. |
 | `references/ownership_and_sharing.md` | The recipe for Step 6: making a table owned and shareable. |
 | `references/deployment.md` | One https origin, proxy, headers, mail, backup. |
 
@@ -75,8 +75,12 @@ These are the reason the skill exists. Do not "simplify" them away.
    (`middleware.event_origin`); uploads need a grant (`upload_gate`).
 8. **Handlers do not query.** States reach the database only through
    `call(service.use_case, actor, ...)`.
-9. **Reflex is pinned to 0.10.1.** The gate rests on private Reflex
-   behaviour; 0.11 changes some of it (`references/reflex_auth_facts.md`).
+9. **Reflex is pinned to 0.11.0.** The gate rests on private Reflex
+   behaviour that changes between releases — 0.10.1 → 0.11.0 needed four
+   changes and uncovered a gap (`references/reflex_auth_facts.md`).
+10. **Every way a page opens is gated** — navigation (`on_load_internal`)
+    and first load or reconnect (`hydrate_and_load`). A page needs no
+    on_load handler to be protected.
 
 ## Step 1 — Inspect the target app
 
@@ -96,10 +100,13 @@ Also check, and stop to ask if any is true:
 
 - `auth/`, `service/`, `pages/login.py`, `ui/account.py`, `utils/db.py`,
   `tests/conftest.py` or a `/login` route already exist.
-- **Reflex is not 0.10.1.** A fresh scaffold installs the newest release.
-  Tell the user that the auth code is verified for 0.10.1 only and that
-  Step 3 will pin it; if the app already depends on a newer Reflex feature,
-  stop — do not adapt the templates to another version on the fly.
+- **Reflex is not 0.11.0.** A fresh scaffold installs the newest release.
+  Tell the user that the auth code is verified for 0.11.0 only and that
+  Step 3 will pin it. An app on 0.10.x is upgraded by that pin (check its
+  own code against the scaffold's gotchas afterwards). If the app already
+  depends on a feature of a release newer than 0.11.0, stop — do not adapt
+  the templates to another version on the fly; re-verifying a release is its
+  own task, described in `references/reflex_auth_facts.md`.
 - `git status` is dirty — ask whether to proceed (the edits touch scaffold
   files the user may have changed).
 - The anchors in Step 4 are not found verbatim — the user changed the
@@ -134,7 +141,7 @@ Pin Reflex — this also adds the database extra (magic links need tables) and,
 since 0.10, `greenlet`:
 
 ```bash
-uv add "reflex[db]==0.10.1"
+uv add "reflex[db]==0.11.0"
 scripts/check.sh            # the app must still be green before auth goes in
 ```
 
@@ -290,7 +297,9 @@ export ADMIN_EMAIL=<addr> ADMIN_PASSWORD_HASH='<from hash_password>'
 uv run reflex run
 ```
 
-and check at least: `/` redirects to `/login`; a link from the server log
+and check at least: `/` and an unknown path redirect to `/login` (pages
+without on_load handlers — the first load is gated, not only navigation); a
+link from the server log
 signs in and lands on `redirect_to`; the admin entry is invisible to a user
 and `/admin` and `/admin/groups` send them to `/forbidden`; `/admin-login`
 works (it lands on `/`, with the admin entry now visible) and the admin can

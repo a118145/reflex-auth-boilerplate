@@ -36,7 +36,7 @@ import reflex as rx
 from reflex.event import Event
 from reflex.istate.data import RouterData
 from reflex.middleware.middleware import Middleware
-from reflex.state import OnLoadInternalState, StateUpdate
+from reflex.state import OnLoadInternalState, State, StateUpdate
 from reflex_base.event.context import EventContext
 
 from ..components.toast import notify_error
@@ -56,9 +56,21 @@ log = get_logger(__name__)
 
 _PAGE_LOAD_EVENT = f"{OnLoadInternalState.get_full_name()}.on_load_internal"
 
+# What opens a page. A client-side navigation sends ``on_load_internal``. The
+# first load of a page (and every reconnect) sends ``hydrate_and_load``, which
+# queues ``on_load_internal`` only if the page has on_load handlers — a page
+# without any would otherwise be shown to a signed-out visitor, and no state
+# snapshot is owed to someone who is about to be sent away. ``hydrate`` is the
+# older form of the same event.
+_PAGE_OPENING_EVENTS = frozenset({
+    _PAGE_LOAD_EVENT,
+    f"{State.get_full_name()}.hydrate_and_load",
+    f"{State.get_full_name()}.hydrate",
+})
+
 
 # Where an event came from decides what it may say about who is signed in.
-# Verified against Reflex 0.10.1 (``tests/test_auth_event_origin.py`` drives
+# Verified against Reflex 0.11.0 (``tests/test_auth_event_origin.py`` drives
 # the real event processor):
 #
 # * ``socket``   — sent by a browser. Reflex overwrites ``headers`` and ``sid``
@@ -154,10 +166,11 @@ class AuthMiddleware(Middleware):
             state.router = RouterData.from_router_data(state.router_data)
 
         auth = await state.get_state(AuthState)
-        await self._sync_identity(state, auth, raw, force=event.name == _PAGE_LOAD_EVENT)
+        opens_page = event.name in _PAGE_OPENING_EVENTS
+        await self._sync_identity(state, auth, raw, force=opens_page)
         identity = auth._identity()
 
-        if event.name == _PAGE_LOAD_EVENT:
+        if opens_page:
             return await self._gate_page(state, identity)
 
         try:

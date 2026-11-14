@@ -38,7 +38,8 @@ enforces ownership and sharing. Read `{{app_name}}/auth/__init__.py` and
 
 1. **Everything requires a signed-in user unless `auth/policy.py` says
    otherwise.** New pages and new event handlers are protected without doing
-   anything. Make something public only by adding it to `PUBLIC_ROUTES` or
+   anything — a page needs no `on_load` for that: the first load and every
+   navigation are gated. Make something public only by adding it to `PUBLIC_ROUTES` or
    with `@auth_event(auth=False)` — and update `tests/test_auth_policy.py`,
    which pins the public surface.
 
@@ -117,7 +118,7 @@ enforces ownership and sharing. Read `{{app_name}}/auth/__init__.py` and
     `/admin-login`, `/forbidden` or `/admin*` other than the generated ones.
     Every `/admin*` page is listed in `ROUTE_CHECKS`.
 
-13. **Reflex stays pinned** (`reflex[db]==0.10.1`). The gate rests on
+13. **Reflex stays pinned** (`reflex[db]==0.11.0`). The gate rests on
     private Reflex behaviour; an upgrade is its own change, verified with
     `tests/test_auth_event_origin.py` and a look at the WebSocket frames.
 

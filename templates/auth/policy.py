@@ -56,10 +56,10 @@ def auth_event(fn: Any = None, /, *, auth: AuthValue = True, **event_kwargs: Any
     """
 
     def wrap(f: Callable[..., Any]) -> Any:
+        # On the function, not on the handler ``rx.event`` returns: that is a
+        # frozen object, and ``handler.fn`` is this function.
         setattr(f, AUTH_ATTR, auth)
-        handler: Any = rx.event(f, **event_kwargs) if event_kwargs else rx.event(f)
-        setattr(handler, AUTH_ATTR, auth)
-        return handler
+        return rx.event(f, **event_kwargs) if event_kwargs else rx.event(f)
 
     return wrap(fn) if fn is not None else wrap
 

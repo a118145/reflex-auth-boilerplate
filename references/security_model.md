@@ -148,7 +148,11 @@ never passes through a Reflex state.
 `AuthMiddleware` runs before every event:
 
 1. take the cookie out of the router data of a socket event (see above);
-2. resolve the session when the cookie changed, on every page load, and
+2. resolve the session when the cookie changed, on everything that opens a
+   page — a navigation (`on_load_internal`) and a first load or reconnect
+   (`hydrate_and_load`, which queues `on_load_internal` only for pages that
+   have on_load handlers; gating that alone left pages without any open to a
+   signed-out visitor) — and
    otherwise when the last check is older than `AUTH_SESSION_RECHECK_SECONDS`
    (60) — this bounds how long an ended session or blocked account keeps
    working;
@@ -158,7 +162,7 @@ never passes through a Reflex state.
 
 | Surface | Not signed in | Check fails |
 | --- | --- | --- |
-| Page (`on_load_internal`) | redirect `/login?redirect_to=<path>` | redirect `/forbidden` |
+| Page (navigation, first load, reconnect) | redirect `/login?redirect_to=<path>`; no state snapshot is sent | redirect `/forbidden` |
 | Event handler | redirect `/login` | "Action not allowed" toast, handler not run |
 | Upload (`detached` event) | 401 at the gate | as an event handler, and only with a grant |
 | State field | by convention: only filled by protected handlers | same |
@@ -280,10 +284,17 @@ A failed run is logged and retried the next day.
   `auth/settings.py:public_url_problem` stops a production start unless
   `REFLEX_API_URL` and `REFLEX_DEPLOY_URL` are the same `https://` origin
   (loopback hosts are exempt, for health checks and local smoke tests).
-- **Reflex version.** The event-origin rules rest on private Reflex
-  behaviour verified for 0.10.1. `tests/test_auth_event_origin.py` drives
-  the real event processor, so an upgrade that changes it fails there first;
-  0.11 is known to differ (see `reflex_auth_facts.md`).
+- **Reflex version.** The gate rests on private Reflex behaviour verified
+  for 0.11.0. `tests/test_auth_event_origin.py` drives the real event
+  processor, so an upgrade that changes how events are built fails there
+  first — but not every change shows in a test: the move from 0.10.1 needed
+  a source diff and browser runs (see `reflex_auth_facts.md`). A handler
+  awaited from another handler (0.11) passes the gate under its caller's
+  identity and with its own policy.
+- **The compiled frontend is public.** Reflex serves every page's JavaScript
+  as static files; the gate decides what a visitor is *shown* and which data
+  and handlers they reach, not whether the bundle can be downloaded. Keep
+  secrets and personal data out of page code and state defaults.
 - Rate limits count per client IP. Behind a reverse proxy set
   `AUTH_TRUSTED_PROXIES`, or every user shares the proxy's IP. Many users
   behind one NAT IP share `AUTH_LINK_RATE_LIMIT_PER_IP`.

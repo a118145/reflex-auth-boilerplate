@@ -20,7 +20,7 @@ def origin_of(url: str | None) -> str:
 
 def from_this_app(request: Request) -> bool:
     config = get_config()
-    allowed = {origin_of(config.api_url), origin_of(config.deploy_url)} - {""}
+    allowed = {origin_of(config.api_url), origin_of(config.frontend_url)} - {""}
     origin = request.headers.get("origin")
     if origin is not None and origin != "null":
         return origin in allowed

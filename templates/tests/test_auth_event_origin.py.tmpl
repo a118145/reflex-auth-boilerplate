@@ -1,6 +1,6 @@
 """Where an event comes from, checked against Reflex's real event processor.
 
-``auth.middleware.event_origin`` rests on how Reflex 0.10.1 hands events over:
+``auth.middleware.event_origin`` rests on how Reflex 0.11.0 hands events over:
 a socket event carries the handshake headers, an event a handler queues
 carries nothing and inherits its context, an upload carries nothing at all.
 These tests run events through ``app.event_processor`` — not a hand-built
@@ -23,9 +23,14 @@ from reflex.state import BaseState, OnLoadInternalState, State
 from {{app_name}} import {{app_name}} as app_module
 from {{app_name}}.auth import middleware, security, upload_gate
 from {{app_name}}.auth.cookie import COOKIE_NAME
+from {{app_name}}.auth.policy import auth_event
 from {{app_name}}.auth.service import Identity
 from {{app_name}}.auth.state import AuthState
 
+
+
+def _nobody(ctx: Any) -> bool:
+    return False
 
 
 class OriginProbeState(rx.State):
@@ -48,6 +53,23 @@ class OriginProbeState(rx.State):
     def set_flag(self, value: bool) -> None:
         self.flag = value
 
+    # Awaiting a handler runs it inline, under the caller's event.
+    @rx.event
+    async def await_set_flag(self) -> None:
+        await OriginProbeState.set_flag(True)
+
+    @auth_event(auth=False)
+    async def public_await_set_flag(self) -> None:
+        await OriginProbeState.set_flag(True)
+
+    @auth_event(auth=_nobody)
+    def set_flag_nobody_may(self) -> None:
+        self.flag = True
+
+    @rx.event
+    async def await_nobody_may(self) -> None:
+        await OriginProbeState.set_flag_nobody_may()
+
 
 USER = Identity(session_id=1, user_id=7, email="anna@company.com", is_admin=False)
 SESSION = security.token_hash("user-token")
@@ -58,6 +80,10 @@ PAGE_LOAD = f"{OnLoadInternalState.get_full_name()}.on_load_internal"
 LOAD_ALL = f"{OriginProbeState.get_full_name()}.load_all"  # returns .refresh
 REFRESH = f"{OriginProbeState.get_full_name()}.refresh"
 SET_FLAG = f"{OriginProbeState.get_full_name()}.set_flag"
+AWAIT_SET_FLAG = f"{OriginProbeState.get_full_name()}.await_set_flag"
+PUBLIC_AWAIT_SET_FLAG = f"{OriginProbeState.get_full_name()}.public_await_set_flag"
+NOBODY_MAY = f"{OriginProbeState.get_full_name()}.set_flag_nobody_may"
+AWAIT_NOBODY_MAY = f"{OriginProbeState.get_full_name()}.await_nobody_may"
 
 Seen = list[tuple[str, str]]
 Script = Callable[[Callable[[Event], Awaitable[None]]], Awaitable[None]]
@@ -154,6 +180,38 @@ def test_another_socket_without_the_cookie_cannot_keep_the_identity() -> None:
     _seen, root = _drive(script)
     assert not _auth(root).is_authenticated
     assert _auth(root)._identity() is None
+    assert _probe(root).flag is False
+
+
+# --- Awaited handlers (Reflex 0.11): ``await State.handler()`` runs the
+# handler inline, under the caller's event. It passes the gate like any event.
+
+
+def _one(name: str, *, signed_in: bool) -> tuple[Seen, BaseState]:
+    async def script(send: Callable[[Event], Awaitable[None]]) -> None:
+        await send(_socket_event(name, sid="A", signed_in=signed_in))
+
+    return _drive(script)
+
+
+def test_an_awaited_handler_passes_the_gate_as_its_caller() -> None:
+    seen, root = _one(AWAIT_SET_FLAG, signed_in=True)
+    # It carries the caller's router data, cookie already taken out: the
+    # identity stands, and nobody is signed out by it.
+    assert seen == [(AWAIT_SET_FLAG, "socket"), (SET_FLAG, "socket")]
+    assert _auth(root).is_authenticated
+    assert _probe(root).flag is True
+
+
+def test_a_public_handler_cannot_await_its_way_past_the_login() -> None:
+    seen, root = _one(PUBLIC_AWAIT_SET_FLAG, signed_in=False)
+    assert [name for name, _ in seen] == [PUBLIC_AWAIT_SET_FLAG, SET_FLAG]
+    assert _probe(root).flag is False
+
+
+def test_an_awaited_handler_keeps_its_own_check() -> None:
+    seen, root = _one(AWAIT_NOBODY_MAY, signed_in=True)
+    assert [name for name, _ in seen] == [AWAIT_NOBODY_MAY, NOBODY_MAY]
     assert _probe(root).flag is False
 
 

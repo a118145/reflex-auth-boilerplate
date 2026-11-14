@@ -122,6 +122,22 @@ def test_public_page_loads_for_anonymous() -> None:
     assert _run(root, _event(PAGE_LOAD, route=routes.LOGIN_ROUTE, path="/login")) is None
 
 
+@pytest.mark.parametrize("handler", ["hydrate_and_load", "hydrate"])
+def test_the_first_load_of_a_page_is_gated_like_a_navigation(handler: str) -> None:
+    """A page's first load sends a hydrate event, and ``on_load_internal`` only
+    follows if the page has on_load handlers. Without the gate on the hydrate
+    itself, a page without any would be shown to a signed-out visitor."""
+    hydrate = f"{State.get_full_name()}.{handler}"
+    root = _new_root()
+    update = _run(root, _event(hydrate, route=routes.NOT_FOUND_ROUTE, path="/some/page"))
+    assert _redirect_path(update) == "/login?redirect_to=%2Fsome%2Fpage"
+    assert _run(root, _event(hydrate, route=routes.LOGIN_ROUTE, path="/login")) is None
+    update = _run(root, _event(hydrate, route=routes.ADMIN_ROUTE, path="/admin", token="user-token"))
+    assert _redirect_path(update) == routes.FORBIDDEN_ROUTE
+    signed_in = _event(hydrate, route=routes.NOT_FOUND_ROUTE, path="/x", token="user-token")
+    assert _run(root, signed_in) is None
+
+
 def test_signed_in_page_load_passes() -> None:
     root = _new_root()
     assert (

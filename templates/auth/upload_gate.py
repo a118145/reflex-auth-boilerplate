@@ -44,7 +44,7 @@ from .origin import from_this_app, origin_of
 log = get_logger(__name__)
 
 # Whether the cookie can accompany an upload at all: same origin only.
-ENFORCED = origin_of(get_config().api_url) == origin_of(get_config().deploy_url)
+ENFORCED = origin_of(get_config().api_url) == origin_of(get_config().frontend_url)
 
 UPLOAD_PATH = get_config().prepend_backend_path(str(Endpoint.UPLOAD))
 

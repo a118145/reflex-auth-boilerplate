@@ -71,22 +71,25 @@ it to check the app against the skill's architecture.
 
 ## Verified against
 
-**Reflex 0.10.1** (pinned by the skill), sqlmodel 0.0.50, with the current
-reflex-app-scaffold. Applied to fresh scaffold apps (layout `both`, with and
-without database): ruff, mypy (strict) and the generated tests pass, and the
-app compiles without deprecation warnings. Browser tests in dev mode passed
-for sign-in and `redirect_to`, cookie flags, no token in WebSocket frames,
-forbidden pages, admin login, groups, users, sessions, audit, CSRF refusal
-and logout; and, after applying the ownership recipe to the scaffold's CRUD
-demo, for two users sharing an item (invisible before, readable after, no
-edit controls and no share card for the reader).
+**Reflex 0.11.0** (pinned by the skill), sqlmodel 0.0.50, with the current
+reflex-app-scaffold. Applied to a fresh scaffold app (layout `both`, with
+database): ruff, mypy (strict) and the generated tests pass, and the app
+compiles without deprecation warnings. Browser tests passed in dev mode
+**and in prod `--single-port` mode** for: signed-out redirects (also for
+pages without on_load handlers and unknown paths), sign-in and
+`redirect_to`, cookie flags, no token in WebSocket frames, forbidden pages,
+admin login, groups, users, sessions, audit, CSRF refusal, logout, and the
+upload gate answering 401/403 in front of Reflex's own `/_upload`. After
+applying the ownership recipe to the scaffold's CRUD demo, two users sharing
+an item was tested in dev mode (invisible before, readable after, no edit
+controls and no share card for the reader).
 
-Not re-verified in this version: layouts `top` and `side` (their wiring
-steps are unchanged from the previous version, which was verified on all
-three), and prod `--single-port` mode in a browser.
+The move from 0.10.1 to 0.11.0 was verified by diffing the two releases'
+event, state, config and upload code; what changed is listed in
+[`references/reflex_auth_facts.md`](references/reflex_auth_facts.md).
 
-**Reflex 0.11 is not supported yet** — it changes behaviour the gate relies
-on; see [`references/reflex_auth_facts.md`](references/reflex_auth_facts.md).
+Not re-verified on 0.11.0: layouts `top` and `side`, and the database-less
+path (their wiring steps are unchanged; the latter was verified on 0.10.1).
 
 ## Layout
 
