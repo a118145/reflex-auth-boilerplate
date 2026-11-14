@@ -1,4 +1,4 @@
-"""Admin: accounts — block, unblock, merge. Route gated by ``authz.is_admin``."""
+"""Admin: accounts — block, unblock, merge, delete. Route gated by ``authz.is_admin``."""
 
 import reflex as rx
 
@@ -52,7 +52,15 @@ def _row(user: UserRow) -> rx.Component:
                         variant="soft",
                         color_scheme="gray",
                         disabled=user.blocked,
-                        on_click=AdminState.open_merge(user.id),
+                        on_click=AdminState.open_merge(user.id, False),
+                    ),
+                    rx.button(
+                        rx.icon("trash-2", size=14),
+                        "Delete…",
+                        size="1",
+                        variant="soft",
+                        color_scheme="red",
+                        on_click=AdminState.open_merge(user.id, True),
                     ),
                     spacing="3",
                 ),
@@ -64,17 +72,25 @@ def _row(user: UserRow) -> rx.Component:
 def _merge_dialog() -> rx.Component:
     return rx.dialog.root(
         rx.dialog.content(
-            rx.dialog.title("Merge accounts"),
+            rx.dialog.title(rx.cond(AdminState.delete_mode, "Delete account", "Merge accounts")),
             rx.dialog.description(
-                rx.text(
-                    "The addresses of ",
-                    rx.text.strong(AdminState.merge_source_label),
-                    " move to the account you pick. That account keeps its data; the other one is "
-                    "deleted. Both are signed out everywhere.",
+                rx.cond(
+                    AdminState.delete_mode,
+                    rx.text(
+                        rx.text.strong(AdminState.merge_source_label),
+                        " is deleted and signed out everywhere. The account you pick takes over "
+                        "everything it owns; its group memberships and shares are dropped.",
+                    ),
+                    rx.text(
+                        "The addresses of ",
+                        rx.text.strong(AdminState.merge_source_label),
+                        " move to the account you pick. That account keeps its data; the other "
+                        "one is deleted. Both are signed out everywhere.",
+                    ),
                 ),
             ),
             rx.select.root(
-                rx.select.trigger(placeholder="Merge into…", width="100%"),
+                rx.select.trigger(placeholder="Pick an account…", width="100%"),
                 rx.select.content(
                     rx.foreach(
                         AdminState.merge_candidates,
@@ -86,7 +102,11 @@ def _merge_dialog() -> rx.Component:
             ),
             rx.flex(
                 rx.dialog.close(rx.button("Cancel", variant="soft", color_scheme="gray")),
-                rx.button("Merge", color_scheme="red", on_click=AdminState.confirm_merge),
+                rx.cond(
+                    AdminState.delete_mode,
+                    rx.button("Delete", color_scheme="red", on_click=AdminState.confirm_delete),
+                    rx.button("Merge", color_scheme="red", on_click=AdminState.confirm_merge),
+                ),
                 spacing="3",
                 justify="end",
                 margin_top="1em",
@@ -98,7 +118,7 @@ def _merge_dialog() -> rx.Component:
     )
 
 
-@rx.page(route=routes.ADMIN_ROUTE, title="Admin · Users", on_load=AdminState.load_users)
+@rx.page(route=routes.ADMIN_USERS_ROUTE, title="Admin · Users", on_load=AdminState.load_users)
 def admin_users() -> rx.Component:
     return base_page(
         admin_page(

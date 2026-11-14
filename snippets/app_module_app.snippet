@@ -1,3 +1,8 @@
+# The service's own tables (groups) are plain SQLModel; registering them is
+# what makes `reflex db makemigrations` see them.
+for _table in service_models.TABLES:
+    ModelRegistry.register(_table)
+
 # Authentication: the /_auth HTTP routes set and clear the session cookie,
 # AuthMiddleware gates every event, and a daily task purges dead auth rows.
 # Index 0: the cookie must leave the router data before anything else sees

@@ -1,0 +1,104 @@
+"""The app reaches the database in one place and asks the service for the rest.
+
+``utils/db.py`` opens sessions; states, components, pages and the other
+utils never do, and never build a query. What they get back are the
+service's read models — so who may see what is decided in ``service/``, not
+wherever a query happened to be written. The auth package owns its own
+tables and is the exception.
+
+``LEGACY`` lists the modules that still query by hand (the scaffold's CRUD
+demo, written before the app had users). The list may only shrink: move a
+module's queries into ``service/`` as use cases that take the acting user's
+id, then delete its entry.
+"""
+
+import ast
+from pathlib import Path
+
+APP = Path(__file__).parent.parent / "{{app_name}}"
+SESSION_OPENERS = {"utils/db.py"}
+OWN_TABLES = ("auth/", "service/", "models/")  # auth owns its tables; the service is the gate
+
+# Modules that still open sessions or build queries themselves.
+LEGACY: set[str] = {{legacy_modules}}
+
+
+def _app_files() -> list[tuple[str, ast.Module, str]]:
+    out = []
+    for path in sorted(APP.rglob("*.py")):
+        relative = path.relative_to(APP).as_posix()
+        if relative.startswith(OWN_TABLES) or relative in LEGACY:
+            continue
+        source = path.read_text()
+        out.append((relative, ast.parse(source), source))
+    return out
+
+
+def test_only_utils_db_opens_a_session() -> None:
+    openers = set()
+    for relative, tree, _source in _app_files():
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Attribute)
+                and node.attr in ("session", "asession")
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "rx"
+            ):
+                openers.add(relative)
+    assert openers == SESSION_OPENERS
+
+
+def test_nothing_outside_the_service_builds_a_query() -> None:
+    offenders = []
+    for relative, tree, _source in _app_files():
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.level == 0:
+                module = node.module or ""
+                names = {alias.name for alias in node.names}
+                if module.split(".")[0] == "sqlalchemy":
+                    offenders.append(f"{relative}: imports {module}")
+                # ``Session`` alone is an annotation for a function run by ``call``.
+                if module.split(".")[0] == "sqlmodel" and names - {"Session"}:
+                    offenders.append(f"{relative}: imports {sorted(names)} from sqlmodel")
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name.split(".")[0] in ("sqlalchemy", "sqlmodel"):
+                        offenders.append(f"{relative}: imports {alias.name}")
+    assert offenders == []
+
+
+def test_nothing_outside_the_service_reads_rows_by_hand() -> None:
+    """``db.get`` / ``db.exec`` on a session: a read nobody checked."""
+    offenders = []
+    for relative, tree, _source in _app_files():
+        if relative in SESSION_OPENERS:
+            continue
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in ("get", "exec", "execute", "add", "commit", "delete")
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in ("db", "session")
+            ):
+                offenders.append(f"{relative}:{node.lineno}")
+    assert offenders == []
+
+
+def test_legacy_modules_exist() -> None:
+    """An entry for a module that is gone, or was moved to the service, must
+    be removed — the list only ever shrinks."""
+    assert all((APP / relative).is_file() for relative in LEGACY)
+
+
+def test_the_service_does_not_know_the_ui() -> None:
+    for path in (APP / "service").rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.ImportFrom):
+                module = node.module or ""
+                assert module.split(".")[0] != "reflex", path
+                if node.level == 2:  # ``from ..x import``: a sibling package of the app
+                    assert module.split(".")[0] in ("", "models"), path
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    assert alias.name.split(".")[0] != "reflex", path

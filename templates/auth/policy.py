@@ -93,6 +93,16 @@ PUBLIC_ROUTES: frozenset[str] = frozenset(
 # Routes that need more than a signed-in user.
 ROUTE_CHECKS: dict[str, AuthCheck] = {
     routes.ADMIN_ROUTE: authz.is_admin,
+    routes.ADMIN_USERS_ROUTE: authz.is_admin,
     routes.ADMIN_SESSIONS_ROUTE: authz.is_admin,
     routes.ADMIN_AUDIT_ROUTE: authz.is_admin,
+    routes.ADMIN_GROUPS_ROUTE: authz.is_admin,
 }
+
+# The event decorators for handlers that need more than a signed-in user.
+# Named for what they require, defined once: a state never builds its own
+# from ``auth_event(auth=...)``, so the same name cannot mean different checks
+# in different modules. ``*_task`` is the background-task form.
+share_owner_event = auth_event(auth=authz.owns_open_share_target)
+admin_event = auth_event(auth=authz.is_admin)
+admin_task = auth_event(auth=authz.is_admin, background=True)

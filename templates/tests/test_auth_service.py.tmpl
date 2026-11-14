@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 from sqlalchemy import update
-from sqlmodel import Session, SQLModel, col, create_engine, select
+from sqlmodel import Session, col, select
 
 from {{app_name}}.auth import merge_hooks, security, service, settings
 from {{app_name}}.auth.models import (
@@ -15,11 +15,15 @@ from {{app_name}}.auth.models import (
     AuthLinkToken,
     AuthLoginAttempt,
     AuthSession,
+    AuthUser,
     AuthUserEmail,
     now,
 )
+from {{app_name}}.service import GroupMember
 
-ADMIN = "admin@firma.de"
+from .conftest import Probe
+
+ADMIN = "admin@company.com"
 ADMIN_PASSWORD = "correct horse battery"
 IP = "192.0.2.10"
 
@@ -30,19 +34,15 @@ def admin_hash() -> str:
 
 
 @pytest.fixture
-def db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, admin_hash: str) -> Iterator[Session]:
-    monkeypatch.setattr(settings, "ALLOWED_DOMAINS", frozenset({"firma.de"}))
+def db(db: Session, monkeypatch: pytest.MonkeyPatch, admin_hash: str) -> Session:
+    """The throwaway database of ``conftest``, with the auth settings fixed."""
+    monkeypatch.setattr(settings, "ALLOWED_DOMAINS", frozenset({"company.com"}))
     monkeypatch.setattr(settings, "ADMIN_EMAIL", ADMIN)
     monkeypatch.setattr(settings, "ADMIN_PASSWORD_HASH", admin_hash)
     monkeypatch.setattr(settings, "LINK_RATE_LIMIT", 5)
     monkeypatch.setattr(settings, "LINK_RATE_LIMIT_PER_IP", 5)
-    engine = create_engine(f"sqlite:///{tmp_path / 'auth.db'}")
-    # Filtered create_all: only the auth tables, never every registered model.
-    tables = [SQLModel.metadata.tables[t.__name__.lower()] for t in AUTH_TABLES]
-    SQLModel.metadata.create_all(engine, tables=tables)
-    with Session(engine) as session:
-        yield session
-    engine.dispose()
+    monkeypatch.setattr(settings, "LINK_REQUESTS_PER_IP", 30)
+    return db
 
 
 def sign_in(db: Session, email: str, redirect_to: str = "/") -> str:
@@ -72,21 +72,21 @@ def user_id(db: Session, token_hash: str) -> int:
 
 def test_link_signs_in_and_creates_the_account_once(db: Session) -> None:
     assert db.exec(select(AuthUserEmail)).first() is None  # requesting creates nothing
-    first = sign_in(db, "Anna@Firma.de", "/data")
-    second = sign_in(db, "anna@firma.de")
+    first = sign_in(db, "Anna@Company.com", "/data")
+    second = sign_in(db, "anna@company.com")
     assert user_id(db, first) == user_id(db, second)
     assert len(db.exec(select(AuthUserEmail)).all()) == 1
 
 
 def test_redirect_target_survives_the_round_trip(db: Session) -> None:
-    token, _ = service.request_link(db, "anna@firma.de", client_ip=IP, redirect_to="/data/7")
+    token, _ = service.request_link(db, "anna@company.com", client_ip=IP, redirect_to="/data/7")
     assert token is not None
     result = service.redeem_link(db, token, client_ip=IP, user_agent="")
     assert result is not None and result[1] == "/data/7"
 
 
 def test_link_is_single_use(db: Session) -> None:
-    token, _ = service.request_link(db, "anna@firma.de", client_ip=IP, redirect_to="/")
+    token, _ = service.request_link(db, "anna@company.com", client_ip=IP, redirect_to="/")
     assert token is not None
     assert service.peek_link(db, token)  # peeking spends nothing
     assert service.peek_link(db, token)
@@ -95,16 +95,17 @@ def test_link_is_single_use(db: Session) -> None:
     assert service.redeem_link(db, token, client_ip=IP, user_agent="") is None
 
 
-def test_new_link_kills_the_previous_one(db: Session) -> None:
-    old, _ = service.request_link(db, "anna@firma.de", client_ip=IP, redirect_to="/")
-    new, _ = service.request_link(db, "anna@firma.de", client_ip=IP, redirect_to="/")
+def test_new_link_leaves_the_previous_one_usable(db: Session) -> None:
+    # Otherwise anyone who knows an address could keep invalidating its links.
+    old, _ = service.request_link(db, "anna@company.com", client_ip=IP, redirect_to="/")
+    new, _ = service.request_link(db, "anna@company.com", client_ip="198.51.100.9", redirect_to="/")
     assert old is not None and new is not None
-    assert service.redeem_link(db, old, client_ip=IP, user_agent="") is None
+    assert service.redeem_link(db, old, client_ip=IP, user_agent="") is not None
     assert service.redeem_link(db, new, client_ip=IP, user_agent="") is not None
 
 
 def test_expired_link_is_refused(db: Session) -> None:
-    token, _ = service.request_link(db, "anna@firma.de", client_ip=IP, redirect_to="/")
+    token, _ = service.request_link(db, "anna@company.com", client_ip=IP, redirect_to="/")
     assert token is not None
     db.exec(update(AuthLinkToken).values(expires_at=now() - timedelta(seconds=1)))
     db.commit()
@@ -116,7 +117,7 @@ def test_expired_link_is_refused(db: Session) -> None:
     [
         ("not an address", "invalid_address"),
         ("eve@evil.test", "domain_not_allowed"),
-        ("eve@sub.firma.de", "domain_not_allowed"),
+        ("eve@sub.company.com", "domain_not_allowed"),
         (ADMIN, "admin_address"),
     ],
 )
@@ -127,22 +128,69 @@ def test_refused_requests_issue_no_token(db: Session, email: str, outcome: str) 
 
 def test_rate_limit_per_address_and_per_ip(db: Session) -> None:
     for _ in range(settings.LINK_RATE_LIMIT):
-        assert service.request_link(db, "anna@firma.de", client_ip=IP, redirect_to="/")[1] == "sent"
+        assert (
+            service.request_link(db, "anna@company.com", client_ip=IP, redirect_to="/")[1] == "sent"
+        )
     assert (
-        service.request_link(db, "anna@firma.de", client_ip="198.51.100.1", redirect_to="/")[1]
+        service.request_link(db, "anna@company.com", client_ip="198.51.100.1", redirect_to="/")[1]
         == "rate_limited"
     )
     # Same IP, other address: the per-IP limit is exhausted too.
     assert (
-        service.request_link(db, "bert@firma.de", client_ip=IP, redirect_to="/")[1]
+        service.request_link(db, "bert@company.com", client_ip=IP, redirect_to="/")[1]
         == "rate_limited"
     )
+
+
+def test_requests_past_the_per_ip_limit_are_dropped_unaudited(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "LINK_REQUESTS_PER_IP", 3)
+
+    def request(ip: str = IP) -> str:
+        # A foreign domain: never issues a token, so the link limits never bite.
+        return service.request_link(db, "eve@evil.test", client_ip=ip, redirect_to="/")[1]
+
+    def audited() -> list[str]:
+        return [e.event for e in db.exec(select(AuthAuditEvent)).all()]
+
+    assert [request() for _ in range(3)] == ["domain_not_allowed"] * 3
+    assert [request() for _ in range(5)] == ["ip_flooding"] * 5
+    # Three requests, one note that the limit was hit — and then nothing more.
+    assert audited() == [service.LINK_REQUESTED] * 3 + [service.LINK_FLOOD]
+    # Even a request that would otherwise get a link.
+    token, outcome = service.request_link(db, "anna@company.com", client_ip=IP, redirect_to="/")
+    assert (token, outcome) == (None, "ip_flooding")
+    assert request("198.51.100.1") == "domain_not_allowed"
+    # The window passes.
+    db.exec(update(AuthAuditEvent).values(created_at=now() - settings.LINK_RATE_WINDOW * 2))
+    db.commit()
+    assert request() == "domain_not_allowed"
+
+
+def test_rate_limit_counts_over_its_own_window_not_the_link_lifetime(db: Session) -> None:
+    def age_all(by: timedelta) -> None:
+        db.exec(update(AuthLinkToken).values(created_at=now() - by))
+        db.commit()
+
+    def request() -> str:
+        return service.request_link(db, "anna@company.com", client_ip=IP, redirect_to="/")[1]
+
+    for _ in range(settings.LINK_RATE_LIMIT):
+        assert request() == "sent"
+    # Long expired, still inside the window: a short link lifetime must not
+    # loosen the limit.
+    age_all(settings.LINK_EXPIRATION + timedelta(minutes=1))
+    assert settings.LINK_EXPIRATION < settings.LINK_RATE_WINDOW
+    assert request() == "rate_limited"
+    age_all(settings.LINK_RATE_WINDOW + timedelta(minutes=1))
+    assert request() == "sent"
 
 
 def test_link_issued_before_domain_was_removed_is_refused(
     db: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    token, _ = service.request_link(db, "anna@firma.de", client_ip=IP, redirect_to="/")
+    token, _ = service.request_link(db, "anna@company.com", client_ip=IP, redirect_to="/")
     assert token is not None
     monkeypatch.setattr(settings, "ALLOWED_DOMAINS", frozenset({"other.de"}))
     assert service.redeem_link(db, token, client_ip=IP, user_agent="") is None
@@ -157,7 +205,7 @@ def test_admin_login_and_admin_flag(db: Session) -> None:
 
 
 def test_magic_link_session_is_never_admin(db: Session) -> None:
-    identity = service.resolve_session(db, sign_in(db, "anna@firma.de"))
+    identity = service.resolve_session(db, sign_in(db, "anna@company.com"))
     assert identity is not None and not identity.is_admin
 
 
@@ -169,29 +217,42 @@ def test_admin_address_gets_no_link_even_after_admin_exists(db: Session) -> None
 def test_wrong_password_and_unknown_address_look_alike(db: Session) -> None:
     assert service.admin_login(db, ADMIN, "nope", client_ip=IP, user_agent="")[1] == "invalid"
     assert (
-        service.admin_login(db, "who@firma.de", ADMIN_PASSWORD, client_ip=IP, user_agent="")[1]
+        service.admin_login(db, "who@company.com", ADMIN_PASSWORD, client_ip=IP, user_agent="")[1]
         == "invalid"
     )
 
 
-def test_lockout_per_ip_then_global(db: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+def _admin_outcome(db: Session, password: str, ip: str) -> str:
+    return service.admin_login(db, ADMIN, password, client_ip=ip, user_agent="")[1]
+
+
+def test_lockout_is_per_ip(db: Session, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "ADMIN_MAX_FAILURES_PER_IP", 2)
-    monkeypatch.setattr(settings, "ADMIN_MAX_FAILURES_GLOBAL", 3)
     for _ in range(2):
-        service.admin_login(db, ADMIN, "nope", client_ip=IP, user_agent="")
+        assert _admin_outcome(db, "nope", IP) == "invalid"
     # Locked for this IP even with the right password.
-    assert (
-        service.admin_login(db, ADMIN, ADMIN_PASSWORD, client_ip=IP, user_agent="")[1] == "locked"
-    )
-    assert (
-        service.admin_login(db, ADMIN, "nope", client_ip="198.51.100.2", user_agent="")[1]
-        == "invalid"
-    )
-    # Three failures overall: locked everywhere.
-    assert (
-        service.admin_login(db, ADMIN, ADMIN_PASSWORD, client_ip="198.51.100.3", user_agent="")[1]
-        == "locked"
-    )
+    assert _admin_outcome(db, ADMIN_PASSWORD, IP) == "locked"
+    assert _admin_outcome(db, ADMIN_PASSWORD, "198.51.100.2") == "ok"
+
+
+def test_many_failures_elsewhere_do_not_lock_the_admin_out(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "ADMIN_MAX_FAILURES_PER_IP", 3)
+    monkeypatch.setattr(settings, "ADMIN_MAX_FAILURES_GLOBAL", 4)
+    for n in range(4):
+        assert _admin_outcome(db, "nope", f"198.51.100.{n}") == "invalid"
+    events = [e.event for e in db.exec(select(AuthAuditEvent)).all()]
+    assert events.count("auth.admin_under_attack") == 1
+    # Under attack every IP has a single failure: those four are spent ...
+    assert _admin_outcome(db, ADMIN_PASSWORD, "198.51.100.0") == "locked"
+    # ... a fifth guesser gets one try and no more ...
+    assert _admin_outcome(db, "nope", "198.51.100.50") == "invalid"
+    assert _admin_outcome(db, ADMIN_PASSWORD, "198.51.100.50") == "locked"
+    # ... and the admin, from an address that has not failed, still gets in.
+    assert _admin_outcome(db, ADMIN_PASSWORD, "203.0.113.7") == "ok"
+    events = [e.event for e in db.exec(select(AuthAuditEvent)).all()]
+    assert events.count("auth.admin_under_attack") == 1
 
 
 def test_admin_login_disabled_without_configuration(
@@ -208,7 +269,7 @@ def test_admin_login_disabled_without_configuration(
 
 
 def test_logout_ends_one_session_logout_everywhere_ends_all(db: Session) -> None:
-    a, b, c = (sign_in(db, "anna@firma.de") for _ in range(3))
+    a, b, c = (sign_in(db, "anna@company.com") for _ in range(3))
     service.logout(db, a, everywhere=False, client_ip=IP)
     assert service.resolve_session(db, a) is None
     assert service.resolve_session(db, b) is not None
@@ -218,7 +279,7 @@ def test_logout_ends_one_session_logout_everywhere_ends_all(db: Session) -> None
 
 
 def test_expired_session_does_not_resolve(db: Session) -> None:
-    token_hash = sign_in(db, "anna@firma.de")
+    token_hash = sign_in(db, "anna@company.com")
     db.exec(update(AuthSession).values(expires_at=now() - timedelta(seconds=1)))
     db.commit()
     assert service.resolve_session(db, token_hash) is None
@@ -226,11 +287,23 @@ def test_expired_session_does_not_resolve(db: Session) -> None:
 
 def test_admin_revokes_a_session(db: Session) -> None:
     admin_id = user_id(db, admin_sign_in(db))
-    token_hash = sign_in(db, "anna@firma.de")
+    token_hash = sign_in(db, "anna@company.com")
     identity = service.resolve_session(db, token_hash)
     assert identity is not None
     service.revoke_session(db, identity.session_id, actor_user_id=admin_id)
     assert service.resolve_session(db, token_hash) is None
+
+
+def test_admin_counts(db: Session) -> None:
+    admin_id = user_id(db, admin_sign_in(db))
+    sign_in(db, "anna@company.com")
+    ben = service.resolve_session(db, sign_in(db, "ben@company.com"))
+    assert ben is not None
+    service.revoke_session(db, ben.session_id, actor_user_id=admin_id)
+    db.add(AuthAuditEvent(event="old", created_at=now() - timedelta(days=8)))
+    db.commit()
+    week = db.exec(select(AuthAuditEvent).where(col(AuthAuditEvent.event) != "old")).all()
+    assert service.admin_counts(db) == service.AdminCounts(3, 2, len(week))
 
 
 # --- block
@@ -238,16 +311,16 @@ def test_admin_revokes_a_session(db: Session) -> None:
 
 def test_block_ends_sessions_and_stops_links(db: Session) -> None:
     admin_id = user_id(db, admin_sign_in(db))
-    token_hash = sign_in(db, "anna@firma.de")
+    token_hash = sign_in(db, "anna@company.com")
     anna = user_id(db, token_hash)
     service.set_blocked(db, anna, True, actor_user_id=admin_id)
     assert service.resolve_session(db, token_hash) is None
     assert (
-        service.request_link(db, "anna@firma.de", client_ip="198.51.100.9", redirect_to="/")[1]
+        service.request_link(db, "anna@company.com", client_ip="198.51.100.9", redirect_to="/")[1]
         == "blocked"
     )
     service.set_blocked(db, anna, False, actor_user_id=admin_id)
-    sign_in(db, "anna@firma.de")
+    sign_in(db, "anna@company.com")
 
 
 def test_admin_account_cannot_be_blocked(db: Session) -> None:
@@ -261,8 +334,8 @@ def test_admin_account_cannot_be_blocked(db: Session) -> None:
 
 def test_merge_moves_addresses_and_signs_both_out(db: Session) -> None:
     admin_id = user_id(db, admin_sign_in(db))
-    old = sign_in(db, "anna.alt@firma.de")
-    new = sign_in(db, "anna.neu@firma.de")
+    old = sign_in(db, "anna.old@company.com")
+    new = sign_in(db, "anna.new@company.com")
     source, target = user_id(db, old), user_id(db, new)
     seen: list[tuple[int, int]] = []
     merge_hooks.MERGE_HOOKS.append(lambda _db, s, t: seen.append((s, t)))
@@ -273,8 +346,8 @@ def test_merge_moves_addresses_and_signs_both_out(db: Session) -> None:
     assert seen == [(source, target)]
     assert service.resolve_session(db, old) is None and service.resolve_session(db, new) is None
     # Either address now signs in to the surviving account.
-    assert user_id(db, sign_in(db, "anna.alt@firma.de")) == target
-    assert user_id(db, sign_in(db, "anna.neu@firma.de")) == target
+    assert user_id(db, sign_in(db, "anna.old@company.com")) == target
+    assert user_id(db, sign_in(db, "anna.new@company.com")) == target
     events = db.exec(
         select(AuthAuditEvent).where(col(AuthAuditEvent.event) == "admin.users_merged")
     ).all()
@@ -284,8 +357,8 @@ def test_merge_moves_addresses_and_signs_both_out(db: Session) -> None:
 @pytest.mark.parametrize("which", ["same", "admin", "blocked"])
 def test_merge_refusals(db: Session, which: str) -> None:
     admin_id = user_id(db, admin_sign_in(db))
-    a = user_id(db, sign_in(db, "a@firma.de"))
-    b = user_id(db, sign_in(db, "b@firma.de"))
+    a = user_id(db, sign_in(db, "a@company.com"))
+    b = user_id(db, sign_in(db, "b@company.com"))
     if which == "blocked":
         service.set_blocked(db, b, True, actor_user_id=admin_id)
     source, target = {"same": (a, a), "admin": (a, admin_id), "blocked": (a, b)}[which]
@@ -293,11 +366,49 @@ def test_merge_refusals(db: Session, which: str) -> None:
         service.merge_users(db, source, target, actor_user_id=admin_id)
 
 
+# --- delete
+
+
+def test_delete_hands_data_over_and_removes_the_account(db: Session) -> None:
+    admin_id = user_id(db, admin_sign_in(db))
+    gone = sign_in(db, "gone@company.com")
+    source, target = user_id(db, gone), user_id(db, sign_in(db, "heir@company.com"))
+    db.add(Probe(name="P", owner_id=source))
+    db.add(GroupMember(group_id=1, user_id=source))
+    db.commit()
+    service.delete_user(db, source, target, actor_user_id=admin_id)
+    assert db.exec(select(Probe.owner_id)).all() == [target]
+    assert not db.exec(select(GroupMember)).all()
+    assert service.resolve_session(db, gone) is None
+    assert not db.exec(select(AuthUserEmail).where(col(AuthUserEmail.user_id) == source)).all()
+    event = db.exec(
+        select(AuthAuditEvent).where(col(AuthAuditEvent.event) == "admin.user_deleted")
+    ).one()
+    assert event.subject_user_id == source and f"new_owner={target}" in event.detail
+    # The address may sign up again, as a new, empty account.
+    assert user_id(db, sign_in(db, "gone@company.com")) not in (source, target)
+
+
+@pytest.mark.parametrize("which", ["self", "same", "missing", "admin", "blocked"])
+def test_delete_refusals(db: Session, which: str) -> None:
+    admin_id = user_id(db, admin_sign_in(db))
+    a = user_id(db, sign_in(db, "a@company.com"))
+    b = user_id(db, sign_in(db, "b@company.com"))
+    if which == "blocked":
+        service.set_blocked(db, b, True, actor_user_id=admin_id)
+    cases = {"self": (a, b, a), "same": (a, a, admin_id), "missing": (a, 999, admin_id)}
+    cases |= {"admin": (a, admin_id, admin_id), "blocked": (a, b, admin_id)}
+    source, target, actor = cases[which]
+    with pytest.raises(service.AdminActionError):
+        service.delete_user(db, source, target, actor_user_id=actor)
+    assert db.get(AuthUser, a) is not None
+
+
 # --- audit
 
 
 def test_audit_never_stores_an_address_in_clear(db: Session) -> None:
-    sign_in(db, "anna@firma.de")
+    sign_in(db, "anna@company.com")
     service.request_link(db, "eve@evil.test", client_ip=IP, redirect_to="/")
     for row in db.exec(select(AuthAuditEvent)).all():
         assert "@" not in row.email_hash + row.detail
@@ -308,11 +419,11 @@ def test_audit_never_stores_an_address_in_clear(db: Session) -> None:
 
 
 def test_purge_removes_only_dead_rows_past_the_cutoff(db: Session) -> None:
-    keep = sign_in(db, "anna@firma.de")
-    gone = sign_in(db, "bert@firma.de")
+    keep = sign_in(db, "anna@company.com")
+    gone = sign_in(db, "bert@company.com")
     service.logout(db, gone, everywhere=False, client_ip=IP)
     service.admin_login(db, ADMIN, "nope", client_ip=IP, user_agent="")
-    pending, _ = service.request_link(db, "carl@firma.de", client_ip=IP, redirect_to="/")
+    pending, _ = service.request_link(db, "carl@company.com", client_ip=IP, redirect_to="/")
     audit_before = len(db.exec(select(AuthAuditEvent)).all())
 
     # Nothing is old enough yet.

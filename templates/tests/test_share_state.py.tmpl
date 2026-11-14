@@ -1,0 +1,163 @@
+"""Sharing from a page: the owner shares with people and groups and switches
+"visible to everyone"; everyone else is refused by the handlers' check and
+again by the service. One state serves every shareable kind."""
+
+import asyncio
+from typing import Any
+
+import pytest
+import reflex as rx
+from reflex.state import State
+from sqlmodel import Session
+
+from {{app_name}} import service
+from {{app_name}}.auth.authz import owns_open_share_target
+from {{app_name}}.auth.context import AuthContext
+from {{app_name}}.auth.policy import handler_policy
+from {{app_name}}.auth.service import Identity
+from {{app_name}}.service import sharing
+from {{app_name}}.states import share_state
+from {{app_name}}.states.share_state import ShareState as S
+
+from .conftest import ALICE, BOB, CAROL, PROBES, Probe, probe
+
+WRITES = (
+    "set_share_email",
+    "add_share",
+    "remove_share",
+    "set_share_group",
+    "add_group_share",
+    "remove_group_share",
+    "set_shared_with_all",
+)
+
+
+class Page:
+    """A browser tab: one ``ShareState``, a signed-in user."""
+
+    def __init__(self, db: Session, monkeypatch: pytest.MonkeyPatch, me: int) -> None:
+        self.me = me
+
+        async def actor(_: Any) -> int:
+            return self.me
+
+        engine = db.get_bind()
+        monkeypatch.setattr(rx, "session", lambda: Session(engine))
+        monkeypatch.setattr(share_state, "actor_id", actor)
+        monkeypatch.setattr(share_state, "user_by_email", lambda _db, _email: BOB)
+        monkeypatch.setattr(
+            share_state, "emails_for", lambda _db, ids: {u: f"user{u}@lab.org" for u in ids}
+        )
+        internal: dict[str, Any] = {"_reflex_internal_init": True}
+        self.root = State(**internal)
+        state = asyncio.run(self.root.get_state(S))
+        assert isinstance(state, S)
+        self.state = state
+
+    def open(self, target_id: int) -> None:
+        """Navigate to the page of ``target_id``; what its ``load_*`` does."""
+        asyncio.run(self.state._open(PROBES, str(target_id)))
+
+    def call(self, handler: str, *args: Any) -> Any:
+        out = S.event_handlers[handler].fn(self.state, *args)
+        return asyncio.run(out) if asyncio.iscoroutine(out) else out
+
+    def allowed(self) -> bool:
+        ctx = AuthContext(Identity(1, self.me, "x@lab.org", False), "/", "e", {}, self.root)
+        return asyncio.run(owns_open_share_target(ctx))
+
+
+def _public(db: Session, target_id: int) -> bool:
+    db.expire_all()
+    item = db.get(Probe, target_id)
+    return item is not None and item.shared_with_all
+
+
+def test_every_write_carries_the_owner_check() -> None:
+    for name in WRITES:
+        assert handler_policy(S.event_handlers[name].fn) is owns_open_share_target, name
+
+
+def test_the_owner_shares_and_stops(db: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+    target = probe(db, ALICE)
+    lab = service.create_group(db, CAROL, "Lab").id or 0
+    page = Page(db, monkeypatch, ALICE)
+    page.open(target)
+    assert page.state.is_owner and page.allowed()
+    assert page.state.group_options == [{"id": str(lab), "name": "Lab"}]
+
+    page.call("set_share_email", "bob@lab.org")
+    page.call("add_share")
+    page.call("set_share_group", str(lab))
+    page.call("add_group_share")
+    page.call("set_shared_with_all", True)
+    assert sharing.user_shares_of(db, PROBES, target) == [BOB]
+    assert sharing.group_shares_of(db, PROBES, target) == [lab]
+    assert _public(db, target)
+    # The card shows what was just done, without another page load.
+    assert page.state.shares == [{"id": str(BOB), "email": f"user{BOB}@lab.org"}]
+    assert page.state.group_shares == [{"id": str(lab), "name": "Lab"}]
+    assert page.state.group_options == [] and page.state.shared_with_all
+    assert (page.state.share_email, page.state.share_group) == ("", "")
+
+    assert page.call("add_group_share") is not None  # nothing picked: a toast
+    page.call("remove_share", str(BOB))
+    page.call("remove_group_share", str(lab))
+    page.call("set_shared_with_all", False)
+    assert sharing.user_shares_of(db, PROBES, target) == []
+    assert sharing.group_shares_of(db, PROBES, target) == []
+    assert not _public(db, target)
+    assert page.state.shares == [] and page.state.group_shares == []
+
+
+def test_nobody_else_gets_the_card_or_past_the_check(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = probe(db, ALICE)
+    sharing.share_with_user(db, PROBES, ALICE, target, BOB)  # a reader is still not the owner
+    page = Page(db, monkeypatch, BOB)
+    page.open(target)
+    assert not page.state.is_owner and not page.allowed()
+    assert page.state.shares == [] and page.state.group_options == []
+
+
+def test_past_the_check_the_service_still_refuses(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = probe(db, ALICE)
+    lab = service.create_group(db, CAROL, "Lab").id or 0
+    sharing.share_with_user(db, PROBES, ALICE, target, CAROL)
+    page = Page(db, monkeypatch, BOB)
+    # As if the check had been bypassed: the state claims Bob's page is open.
+    page.state._kind, page.state._target_id, page.state._owner_id = PROBES.kind, target, BOB
+    page.state.share_group = str(lab)
+    for handler, args in (
+        ("add_share", ()),
+        ("remove_share", (str(CAROL),)),
+        ("add_group_share", ()),
+        ("remove_group_share", (str(lab),)),
+        ("set_shared_with_all", (True,)),
+    ):
+        assert page.call(handler, *args) is not None, handler  # refused: a toast
+    assert sharing.user_shares_of(db, PROBES, target) == [CAROL]
+    assert sharing.group_shares_of(db, PROBES, target) == []
+    assert not _public(db, target)
+
+
+def test_one_pages_target_never_carries_over_to_the_next(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One state for every page: opening something Alice does not own must
+    leave nothing of what she had open before."""
+    mine, theirs = probe(db, ALICE, "Mine"), probe(db, BOB, "Theirs")
+    sharing.set_shared_with_all(db, PROBES, BOB, theirs, True)  # she may read it
+    page = Page(db, monkeypatch, ALICE)
+    page.open(mine)
+    assert page.allowed()
+
+    page.open(theirs)
+    assert not page.state.is_owner and not page.allowed()
+    assert (page.state._kind, page.state._target_id, page.state._owner_id) == ("", None, None)
+    assert page.call("set_shared_with_all", False) is not None  # nothing open: a toast
+    assert _public(db, theirs)
+    assert not _public(db, mine)

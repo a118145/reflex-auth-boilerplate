@@ -9,7 +9,9 @@ from ..navigation import routes
 SHOW_ADMIN_SUBNAV = {{show_admin_subnav}}
 
 _PAGES = [
-    ("Users", "users", routes.ADMIN_ROUTE),
+    ("Overview", "layout-dashboard", routes.ADMIN_ROUTE),
+    ("Users", "users", routes.ADMIN_USERS_ROUTE),
+    ("Groups", "users-round", routes.ADMIN_GROUPS_ROUTE),
     ("Sessions", "key-round", routes.ADMIN_SESSIONS_ROUTE),
     ("Audit log", "scroll-text", routes.ADMIN_AUDIT_ROUTE),
 ]

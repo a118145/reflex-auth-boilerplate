@@ -1,0 +1,96 @@
+"""``POST /_upload`` over HTTP: origin, session, and the grant it leaves."""
+
+import time
+from collections.abc import Iterator
+
+import pytest
+from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.requests import Request
+from starlette.responses import PlainTextResponse
+from starlette.routing import Route
+from starlette.testclient import TestClient
+
+from {{app_name}}.auth import security, upload_gate
+from {{app_name}}.auth.cookie import COOKIE_NAME
+from {{app_name}}.auth.service import Identity
+
+USER = Identity(session_id=1, user_id=7, email="anna@company.com", is_admin=False)
+SESSION = security.token_hash("user-token")
+ORIGIN = "http://localhost:3000"  # Reflex's default deploy_url
+HEADERS = {"origin": ORIGIN, "reflex-client-token": "client-token"}
+
+
+async def _upload(request: Request) -> PlainTextResponse:
+    # What Reflex's own route would see: is the grant there while it runs?
+    inside = upload_gate.granted("client-token", SESSION)
+    return PlainTextResponse(f"granted={inside}")
+
+
+@pytest.fixture
+def client(monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
+    monkeypatch.setattr(upload_gate, "ENFORCED", True)
+    monkeypatch.setattr(upload_gate, "_grants", {})
+    monkeypatch.setattr(upload_gate, "lookup_session", {SESSION: USER}.get)
+    app = Starlette(
+        routes=[
+            Route(upload_gate.UPLOAD_PATH, _upload, methods=["POST"]),
+            Route("/other", _upload, methods=["POST"]),
+        ],
+        middleware=[Middleware(upload_gate.UploadGate)],
+    )
+    with TestClient(app) as test_client:
+        yield test_client
+
+
+def _signed_in(client: TestClient) -> TestClient:
+    client.cookies.set(COOKIE_NAME, "user-token")
+    return client
+
+
+def test_upload_without_a_session_is_refused(client: TestClient) -> None:
+    response = client.post(upload_gate.UPLOAD_PATH, headers=HEADERS)
+    assert response.status_code == 401
+    assert not upload_gate._grants
+
+
+def test_upload_with_a_dead_session_is_refused(client: TestClient) -> None:
+    client.cookies.set(COOKIE_NAME, "revoked-token")
+    assert client.post(upload_gate.UPLOAD_PATH, headers=HEADERS).status_code == 401
+
+
+def test_upload_from_another_site_is_refused(client: TestClient) -> None:
+    headers = {**HEADERS, "origin": "https://evil.test"}
+    assert _signed_in(client).post(upload_gate.UPLOAD_PATH, headers=headers).status_code == 403
+
+
+def test_upload_without_a_client_token_is_refused(client: TestClient) -> None:
+    response = _signed_in(client).post(upload_gate.UPLOAD_PATH, headers={"origin": ORIGIN})
+    assert response.status_code == 401
+
+
+def test_upload_with_a_session_passes_and_leaves_a_grant(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    response = _signed_in(client).post(upload_gate.UPLOAD_PATH, headers=HEADERS)
+    assert (response.status_code, response.text) == (200, "granted=True")
+    # A small upload is answered before its event is processed.
+    assert upload_gate.granted("client-token", SESSION)
+    assert not upload_gate.granted("client-token", security.token_hash("someone-else"))
+    assert not upload_gate.granted("another-client", SESSION)
+    # ... but not for long.
+    later = time.monotonic() + upload_gate.GRACE_SECONDS + 1
+    monkeypatch.setattr(time, "monotonic", lambda: later)
+    assert not upload_gate.granted("client-token", SESSION)
+
+
+def test_other_routes_are_not_gated(client: TestClient) -> None:
+    assert client.post("/other", headers=HEADERS).status_code == 200
+
+
+def test_gate_stands_aside_on_split_origins(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(upload_gate, "ENFORCED", False)
+    assert client.post(upload_gate.UPLOAD_PATH, headers=HEADERS).status_code == 200
+    assert upload_gate.granted("anyone", "")

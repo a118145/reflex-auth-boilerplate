@@ -11,6 +11,8 @@ Module map:
 * ``security``   — token/password hashing, redirect validation, client IP
 * ``service``    — every database operation; plain functions over a Session
 * ``endpoints``  — backend HTTP routes that set and clear the session cookie
+* ``origin``     — whether an HTTP request came from this app's own pages
+* ``upload_gate`` — ``POST /_upload`` needs a live session; grants for its event
 * ``housekeeping`` — daily purge of dead links, sessions, login attempts
 * ``middleware`` — strips the cookie from router data and gates every event
 * ``policy``     — public routes, route checks, ``auth_event``

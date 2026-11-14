@@ -1,0 +1,86 @@
+"""The admin's groups page, driven through AdminState's handlers."""
+
+import asyncio
+from typing import Any
+
+import pytest
+import reflex as rx
+from reflex.state import State
+from sqlmodel import Session
+
+from {{app_name}} import service
+from {{app_name}}.auth import service as auth_service
+from {{app_name}}.auth.service import UserRow
+from {{app_name}}.service import GroupRow
+from {{app_name}}.states.admin_state import AdminState
+
+ADMIN = 1
+
+
+@pytest.fixture
+def admin(db: Session, monkeypatch: pytest.MonkeyPatch) -> AdminState:
+    async def actor(_: Any) -> int:
+        return ADMIN
+
+    engine = db.get_bind()
+    monkeypatch.setattr(rx, "session", lambda: Session(engine))
+    monkeypatch.setattr(AdminState, "_actor_id", actor)
+    internal: dict[str, Any] = {"_reflex_internal_init": True}
+    state = asyncio.run(State(**internal).get_state(AdminState))
+    assert isinstance(state, AdminState)
+    return state
+
+
+def _call(state: AdminState, handler: str, *args: Any) -> Any:
+    out = AdminState.event_handlers[handler].fn(state, *args)
+    return asyncio.run(out) if asyncio.iscoroutine(out) else out
+
+
+def test_groups_are_listed_by_name_with_their_member_count(db: Session, admin: AdminState) -> None:
+    b, a = (service.create_group(db, ADMIN, name).id or 0 for name in ("Lab B", "Lab A"))
+    service.add_member(db, ADMIN, b, 7)
+    _call(admin, "load_groups")
+    assert admin.groups == [GroupRow(a, "Lab A", 0), GroupRow(b, "Lab B", 1)]
+
+
+def test_create_rename_delete(db: Session, admin: AdminState) -> None:
+    _call(admin, "new_group")
+    _call(admin, "submit_group_name", {"name": " Lab A "})
+    _call(admin, "load_groups")
+    (group,) = admin.groups
+    assert (group.name, group.members, admin.group_dialog) == ("Lab A", 0, "")
+    _call(admin, "ask_rename_group", group.id)
+    assert admin.group_label == "Lab A"
+    _call(admin, "submit_group_name", {"name": "Lab B"})
+    _call(admin, "load_groups")
+    assert admin.groups == [GroupRow(group.id, "Lab B", 0)]
+    _call(admin, "ask_delete_group", group.id)
+    _call(admin, "confirm_delete_group")
+    assert (service.list_groups(db), admin.group_dialog) == ([], "")
+
+
+def test_a_refused_name_keeps_the_dialog_open(db: Session, admin: AdminState) -> None:
+    service.create_group(db, ADMIN, "Lab A")
+    for name in ("Lab A", " ", ""):  # taken, blank, missing
+        _call(admin, "new_group")
+        _call(admin, "submit_group_name", {"name": name})
+        assert admin.group_dialog == "new"
+    assert [g.name for g in service.list_groups(db)] == ["Lab A"]
+
+
+def test_add_and_remove_members(
+    db: Session, admin: AdminState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    users = [UserRow(i, f"u{i}@lab.org", "", "", i == 9, 0, False) for i in (7, 8, 9)]
+    monkeypatch.setattr(auth_service, "list_users", lambda _: users)
+    group = service.create_group(db, ADMIN, "Lab A")
+    _call(admin, "open_members", group.id)
+    assert [u.id for u in admin.member_candidates] == [7, 8]  # 9 is blocked
+    _call(admin, "set_member_pick", "7")
+    _call(admin, "add_member")
+    _call(admin, "set_member_pick", "8")
+    _call(admin, "add_member")
+    assert [u.id for u in admin.member_rows] == [7, 8] == service.group_members(db, group.id or 0)
+    assert (admin.member_pick, [u.id for u in admin.member_candidates]) == ("", [])
+    _call(admin, "remove_member", 7)
+    assert service.group_members(db, group.id or 0) == [8] == [u.id for u in admin.member_rows]

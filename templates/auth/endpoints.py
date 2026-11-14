@@ -11,6 +11,8 @@ so signing in and out are plain HTTP requests to the backend, mounted with
 | ``POST /_auth/admin-login`` | Checks the admin password, sets the cookie. |
 | ``POST /_auth/logout`` | Ends this session (or all with ``everywhere=1``). |
 
+``POST /_upload`` is Reflex's own route; ``upload_gate.UploadGate`` wraps it.
+
 The ``GET``/``POST`` split on the link matters: corporate mail scanners
 (Outlook Safe Links and the like) fetch every link in an e-mail before the
 user does. A link that signed in on ``GET`` would be used up — or used — by
@@ -24,12 +26,12 @@ defence. Redirect targets are same-origin paths only.
 from __future__ import annotations
 
 import html
-from urllib.parse import urlsplit
 
 import reflex as rx
 from reflex.config import get_config
 from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
+from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 from starlette.routing import Route
@@ -37,13 +39,9 @@ from starlette.routing import Route
 from ..navigation import routes
 from . import security, service, settings
 from .cookie import COOKIE_NAME, clear_session_cookie, set_session_cookie
+from .origin import from_this_app, origin_of
 from .state import ENDPOINT_PREFIX, frontend_url
-
-
-def _origin(url: str | None) -> str:
-    parts = urlsplit(url or "")
-    return f"{parts.scheme}://{parts.netloc}" if parts.scheme and parts.netloc else ""
-
+from .upload_gate import UploadGate
 
 # ``form-action`` also governs where a form's POST may redirect to, so it
 # must name the frontend origin: in development that is :3000, not 'self'.
@@ -56,21 +54,10 @@ _SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "Content-Security-Policy": (
         "default-src 'none'; style-src 'unsafe-inline'; "
-        f"form-action 'self' {_origin(get_config().deploy_url)}; "
+        f"form-action 'self' {origin_of(get_config().deploy_url)}; "
         "frame-ancestors 'none'; base-uri 'none'"
     ),
 }
-
-
-def _from_this_app(request: Request) -> bool:
-    config = get_config()
-    allowed = {_origin(config.api_url), _origin(config.deploy_url)} - {""}
-    origin = request.headers.get("origin")
-    if origin is not None and origin != "null":
-        return origin in allowed
-    # No usable Origin (some privacy settings send "null"): fall back to the
-    # browser's own verdict. A sandboxed attacker iframe reports cross-site.
-    return request.headers.get("sec-fetch-site") in ("same-origin", "same-site")
 
 
 def _client_ip(request: Request) -> str:
@@ -127,7 +114,7 @@ async def link_get(request: Request) -> Response:
 
 
 async def link_post(request: Request) -> Response:
-    if not _from_this_app(request):
+    if not from_this_app(request):
         return Response("Cross-site request refused.", status_code=403)
     form = await request.form()
     token = str(form.get("t", ""))
@@ -147,7 +134,7 @@ async def link_post(request: Request) -> Response:
 
 
 async def admin_login_post(request: Request) -> Response:
-    if not _from_this_app(request):
+    if not from_this_app(request):
         return Response("Cross-site request refused.", status_code=403)
     form = await request.form()
     email, password = str(form.get("email", "")), str(form.get("password", ""))
@@ -167,7 +154,7 @@ async def admin_login_post(request: Request) -> Response:
 
 
 async def logout_post(request: Request) -> Response:
-    if not _from_this_app(request):
+    if not from_this_app(request):
         return Response("Cross-site request refused.", status_code=403)
     form = await request.form()
     everywhere = form.get("everywhere") == "1"
@@ -187,12 +174,14 @@ async def logout_post(request: Request) -> Response:
 
 def auth_api() -> Starlette:
     """The ``api_transformer`` for ``rx.App``. Reflex mounts itself below it,
-    so these routes take precedence and everything else falls through."""
+    so these routes take precedence and everything else falls through —
+    past ``UploadGate``, which checks ``POST /_upload`` on the way."""
     return Starlette(
+        middleware=[Middleware(UploadGate)],
         routes=[
             Route(f"{ENDPOINT_PREFIX}/link", link_get, methods=["GET"]),
             Route(f"{ENDPOINT_PREFIX}/link", link_post, methods=["POST"]),
             Route(f"{ENDPOINT_PREFIX}/admin-login", admin_login_post, methods=["POST"]),
             Route(f"{ENDPOINT_PREFIX}/logout", logout_post, methods=["POST"]),
-        ]
+        ],
     )

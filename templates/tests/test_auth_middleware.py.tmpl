@@ -21,8 +21,8 @@ from {{app_name}}.auth.state import AuthState
 from {{app_name}}.navigation import routes
 from {{app_name}}.states.admin_state import AdminState
 
-USER = Identity(session_id=1, user_id=7, email="anna@firma.de", is_admin=False)
-ADMIN = Identity(session_id=2, user_id=1, email="admin@firma.de", is_admin=True)
+USER = Identity(session_id=1, user_id=7, email="anna@company.com", is_admin=False)
+ADMIN = Identity(session_id=2, user_id=1, email="admin@company.com", is_admin=True)
 SESSIONS = {"user-token": USER, "admin-token": ADMIN}
 
 
@@ -85,6 +85,23 @@ def test_cookie_is_stripped_and_flagged() -> None:
     assert middleware.take_session_cookie(data) is None
     assert middleware.take_session_cookie({}) is None
     assert middleware.take_session_cookie({"headers": {"cookie": "a=1"}}) == ""
+
+
+def test_a_flag_the_browser_sets_is_not_believed() -> None:
+    # Router data is a dict the browser can add keys to. Only this process's
+    # own mark means "already stripped"; anything else is read as it is.
+    for forged in (True, "1", "", 1):
+        data = {"headers": {"cookie": "a=1"}, middleware._STRIPPED: forged}
+        assert middleware.take_session_cookie(data) == ""
+
+
+def test_cookie_less_event_with_forged_flag_signs_out() -> None:
+    root = _new_root()
+    _run(root, _event(PAGE_LOAD, route=routes.NOT_FOUND_ROUTE, path="/x", token="user-token"))
+    forged = _event(PAGE_LOAD, route=routes.NOT_FOUND_ROUTE, path="/x")
+    forged.router_data[middleware._STRIPPED] = True
+    assert _redirect_path(_run(root, forged)) == f"{routes.LOGIN_ROUTE}?redirect_to=%2Fx"
+    assert not asyncio.run(root.get_state(AuthState)).is_authenticated
 
 
 def test_router_never_carries_the_cookie() -> None:

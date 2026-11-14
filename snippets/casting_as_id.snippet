@@ -1,0 +1,25 @@
+
+
+class InvalidInput(ValueError):
+    """A value from the browser that cannot be what the handler needs. The
+    message is safe to show; ``states.handlers.toast_errors`` shows it."""
+
+
+def as_id(value: object) -> int:
+    """A database id from an event argument or a bound input.
+
+    Event arguments arrive as whatever the browser sent. An id is a positive
+    integer, given as ``int`` or as its decimal string; anything else raises
+    ``InvalidInput`` — never ``ValueError`` from deep inside a handler.
+    """
+    if isinstance(value, bool):
+        raise InvalidInput("That item does not exist.")
+    if isinstance(value, int):
+        number = value
+    elif isinstance(value, str) and value.strip().isdecimal():
+        number = int(value.strip())
+    else:
+        raise InvalidInput("That item does not exist.")
+    if number < 1:
+        raise InvalidInput("That item does not exist.")
+    return number

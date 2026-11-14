@@ -1,5 +1,7 @@
 """Pins the public surface. Widening it must be a deliberate test change."""
 
+from pathlib import Path
+
 from reflex.config import get_config
 from reflex.page import DECORATED_PAGES
 
@@ -47,7 +49,7 @@ def test_only_auth_state_handlers_are_public() -> None:
     while pending:
         cls = pending.pop()
         pending.extend(cls.get_substates())
-        if cls.__module__.split(".")[0] != "{{app_name}}":
+        if cls.__module__.split(".")[0] != "{{app_name}}":  # framework and test states
             continue
         for name, handler in cls.event_handlers.items():
             if handler_policy(handler.fn) is False:
@@ -57,3 +59,46 @@ def test_only_auth_state_handlers_are_public() -> None:
         "AuthState.request_link",
         "AuthState.reset_login_form",
     }
+
+
+# States whose handlers need more than a signed-in user: the one check every
+# handler carries, and the handlers deliberately left to any signed-in user
+# (loading the page, viewer actions, opening a dialog). A handler that is
+# added without the named decorator, or loses it in a refactor, fails here.
+# Add every state that gets an ``owns_open_*`` check, and every ``load_*``
+# handler added to ShareState.
+OWNER_GATED: dict[str, tuple[str, set[str]]] = {
+    "ShareState": ("owns_open_share_target", set()),
+    "AdminState": ("is_admin", set()),
+}
+
+
+def test_owner_gated_states_gate_every_handler_but_the_listed_ones() -> None:
+    seen: set[str] = set()
+    pending = [AuthState.get_root_state()]
+    while pending:
+        cls = pending.pop()
+        pending.extend(cls.get_substates())
+        if cls.__module__.split(".")[0] != "{{app_name}}":  # framework and test states
+            continue
+        policies = {
+            name: handler_policy(handler.fn)
+            for name, handler in cls.event_handlers.items()
+            if name != "setvar"
+        }
+        checks = {p.__name__ for p in policies.values() if not isinstance(p, bool)}
+        if cls.__name__ not in OWNER_GATED:
+            assert not checks, f"{cls.__name__} has checked handlers: add it to OWNER_GATED"
+            continue
+        seen.add(cls.__name__)
+        check, open_to_all = OWNER_GATED[cls.__name__]
+        assert checks == {check}, cls.__name__
+        assert {n for n, p in policies.items() if p is True} == open_to_all, cls.__name__
+    assert seen == set(OWNER_GATED)
+
+
+def test_states_use_the_named_decorators() -> None:
+    # ``auth_event(auth=...)`` is spelled out in ``auth/policy.py`` only.
+    states = Path(__file__).parent.parent / "{{app_name}}" / "states"
+    offenders = [p.name for p in states.glob("*.py") if "auth_event(" in p.read_text()]
+    assert offenders == []
