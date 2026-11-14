@@ -1,0 +1,77 @@
+"""The service package: one module per area, one public surface."""
+
+import ast
+from pathlib import Path
+
+import {{app_name}}.service as service
+
+PACKAGE = Path(service.__file__).parent
+
+# What each module may import from its siblings: one direction only. A new
+# area module goes in here, below what it builds on.
+MAY_IMPORT: dict[str, set[str]] = {
+    "errors": set(),
+    "models": set(),
+    "wire": {"models"},
+    "sharing": {"errors", "models"},
+    "groups": {"errors", "models", "sharing"},
+    "views": {"errors", "models", "wire", "sharing", "groups"},
+    "people": {"errors", "models", "sharing", "groups"},
+}
+
+# Used by their own name (``service.sharing.owned``), not re-exported flat.
+NAMESPACED = {"sharing"}
+
+
+def _modules() -> dict[str, ast.Module]:
+    return {
+        path.stem: ast.parse(path.read_text())
+        for path in PACKAGE.glob("*.py")
+        if path.stem != "__init__"
+    }
+
+
+def _public_names(tree: ast.Module) -> set[str]:
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef | ast.ClassDef):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            names.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names.add(node.target.id)
+    return {n for n in names if not n.startswith("_")}
+
+
+def test_every_module_is_known() -> None:
+    assert set(_modules()) == set(MAY_IMPORT)
+
+
+def test_everything_public_is_re_exported_once() -> None:
+    defined: dict[str, str] = {}
+    for module, tree in _modules().items():
+        if module in NAMESPACED:
+            assert getattr(service, module).__name__ == f"{service.__name__}.{module}"
+            continue
+        for name in _public_names(tree):
+            assert name not in defined, f"{name} is in {defined[name]} and {module}"
+            defined[name] = module
+    # Helpers one sibling needs from another stay out of the public surface.
+    internal = {"PERSON", "member_counts"}
+    assert set(service.__all__) == (set(defined) - internal) | NAMESPACED
+    for name in service.__all__:
+        assert hasattr(service, name), name
+
+
+def test_modules_import_siblings_in_one_direction_only() -> None:
+    for module, tree in _modules().items():
+        siblings: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.level == 1:
+                siblings |= {node.module} if node.module else {a.name for a in node.names}
+        assert siblings <= MAY_IMPORT[module], f"{module} imports {siblings - MAY_IMPORT[module]}"
+
+
+def test_no_module_grows_without_bound() -> None:
+    for path in PACKAGE.glob("*.py"):
+        assert len(path.read_text().splitlines()) < 500, path.name

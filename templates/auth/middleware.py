@@ -4,10 +4,15 @@ Registered at index 0 with ``app.add_middleware(AuthMiddleware(), index=0)``,
 so it runs before Reflex computes any delta. For each event it:
 
 1. **Takes the session cookie out of the router data.** Reflex copies the
-   WebSocket handshake headers — ``cookie`` included — into ``State.router``
-   and serialises them to the browser with every delta. An HttpOnly cookie
-   would be readable from JavaScript through the state. The cookie is
-   removed before that can happen; only its digest is kept, in a private var.
+   WebSocket handshake headers — ``cookie`` included — into ``State.router``,
+   where any backend code reading ``self.router.headers.cookie`` or
+   ``raw_headers`` would see the full cookie string. Since Reflex 0.10 the
+   ``cookie`` and ``authorization`` headers are no longer serialised to the
+   browser, but every other handshake header still is. The cookie is removed
+   here before any handler runs; only its digest is kept, in a private var.
+   **Only an event that arrived on a socket says anything about the cookie**
+   — see ``event_origin``. The Reflex client token that selects the state is
+   not a credential: it sits in ``sessionStorage`` and in the socket URL.
 2. **Resolves the session** against the database when the cookie changed,
    on every page load, and otherwise at most every
    ``AUTH_SESSION_RECHECK_SECONDS`` (60), so a revoked session or a blocked
@@ -20,21 +25,24 @@ so it runs before Reflex computes any delta. For each event it:
 
 from __future__ import annotations
 
+import hmac
+import secrets
 import time
 import urllib.parse
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import reflex as rx
 from reflex.event import Event
 from reflex.istate.data import RouterData
 from reflex.middleware.middleware import Middleware
-from reflex.state import OnLoadInternalState, StateUpdate
+from reflex.state import OnLoadInternalState, State, StateUpdate
+from reflex_base.event.context import EventContext
 
 from ..components.toast import notify_error
 from ..navigation import routes
 from ..utils.logging import get_logger
-from . import security, service, settings
+from . import security, service, settings, upload_gate
 from .context import AuthContext
 from .cookie import COOKIE_NAME
 from .policy import PUBLIC_ROUTES, ROUTE_CHECKS, handler_policy, run_check
@@ -48,27 +56,70 @@ log = get_logger(__name__)
 
 _PAGE_LOAD_EVENT = f"{OnLoadInternalState.get_full_name()}.on_load_internal"
 
+# What opens a page. A client-side navigation sends ``on_load_internal``. The
+# first load of a page (and every reconnect) sends ``hydrate_and_load``, which
+# queues ``on_load_internal`` only if the page has on_load handlers — a page
+# without any would otherwise be shown to a signed-out visitor, and no state
+# snapshot is owed to someone who is about to be sent away. ``hydrate`` is the
+# older form of the same event.
+_PAGE_OPENING_EVENTS = frozenset({
+    _PAGE_LOAD_EVENT,
+    f"{State.get_full_name()}.hydrate_and_load",
+    f"{State.get_full_name()}.hydrate",
+})
 
-# Set on router data whose cookie was already taken out. ``router_data``
-# itself never reaches the client (``is_var=False``), but events that Reflex
-# chains on the backend (the page's ``on_load`` handlers, a handler's returned
-# events) are built from the state's stored, already-stripped copy. Without
-# this flag the missing cookie in such a copy would read as "signed out".
-# A client that sends the key itself only gets to keep its *own* current
-# identity, which is still re-checked against the database on every page
-# load and at least every AUTH_SESSION_RECHECK_SECONDS — so it grants nothing.
+
+# Where an event came from decides what it may say about who is signed in.
+# Verified against Reflex 0.11.0 (``tests/test_auth_event_origin.py`` drives
+# the real event processor):
+#
+# * ``socket``   — sent by a browser. Reflex overwrites ``headers`` and ``sid``
+#   in its router data with the handshake's, on every event, so the cookie it
+#   carries (or lacks) is the truth about that connection.
+# * ``chained``  — queued on the backend by a handler (a page's ``on_load``
+#   handlers, a handler's returned events). Its own router data is empty; its
+#   context inherits the router data of the socket event that started the
+#   chain. It says nothing about the cookie: the identity stands.
+# * ``detached`` — neither: built from an HTTP request (``POST /_upload``),
+#   with no socket behind it. It says nothing about the cookie either, and it
+#   reaches an app handler only with a grant from ``upload_gate``.
+EventOrigin = Literal["socket", "chained", "detached"]
+
+
+def event_origin(event: Event) -> EventOrigin:
+    if isinstance(event.router_data.get("headers"), dict):
+        return "socket"
+    try:
+        ctx = EventContext.get()
+    except LookupError:
+        return "detached"
+    inherited = isinstance(ctx.router_data.get("headers"), dict)
+    return "chained" if ctx.parent_txid is not None and inherited else "detached"
+
+
+# Set on a socket event's router data once its cookie was taken out, so that
+# seeing the same dict again does not read as "no cookie: signed out". The
+# value is a per-process secret: router data is a dict the browser can add
+# keys to, and a flag the browser could set would let a cookie-less connection
+# keep whatever identity the state behind its client token still holds.
 _STRIPPED = "_auth_cookie_stripped"
+_STRIPPED_MARK = secrets.token_hex(16)
+
+
+def _already_stripped(router_data: dict[str, Any]) -> bool:
+    mark = router_data.get(_STRIPPED)
+    return isinstance(mark, str) and hmac.compare_digest(mark, _STRIPPED_MARK)
 
 
 def take_session_cookie(router_data: dict[str, Any]) -> str | None:
     """Remove the session cookie from ``router_data`` in place; return its value.
 
-    ``None`` means this event says nothing about the cookie (no handshake
-    headers, or a copy that was stripped before), so the previous identity
+    ``None`` means this router data says nothing about the cookie (no handshake
+    headers, or this very dict was stripped before), so the previous identity
     stands. ``""`` means the browser sent no session cookie: signed out.
     """
     headers = router_data.get("headers")
-    if router_data.get(_STRIPPED) or not isinstance(headers, dict):
+    if not isinstance(headers, dict) or _already_stripped(router_data):
         return None
     kept: list[str] = []
     value = ""
@@ -81,7 +132,7 @@ def take_session_cookie(router_data: dict[str, Any]) -> str | None:
         else:
             kept.append(f"{name}={raw}")
     headers["cookie"] = "; ".join(kept)
-    router_data[_STRIPPED] = True
+    router_data[_STRIPPED] = _STRIPPED_MARK
     return value
 
 
@@ -115,10 +166,11 @@ class AuthMiddleware(Middleware):
             state.router = RouterData.from_router_data(state.router_data)
 
         auth = await state.get_state(AuthState)
-        await self._sync_identity(state, auth, raw, force=event.name == _PAGE_LOAD_EVENT)
+        opens_page = event.name in _PAGE_OPENING_EVENTS
+        await self._sync_identity(state, auth, raw, force=opens_page)
         identity = auth._identity()
 
-        if event.name == _PAGE_LOAD_EVENT:
+        if opens_page:
             return await self._gate_page(state, identity)
 
         try:
@@ -135,6 +187,11 @@ class AuthMiddleware(Middleware):
             return None
         if identity is None:
             return _login_redirect(state)
+        if event_origin(event) == "detached" and not upload_gate.granted(
+            _client_token(), auth._token_hash
+        ):
+            log.warning("auth.detached_event_denied", event_name=event.name)
+            return _deny_update("Action not allowed")
         if policy is True:
             return None
         ctx = AuthContext(
@@ -188,6 +245,14 @@ async def _reset_app_states(root: BaseState) -> None:
         substate = await root.get_state(cls)
         reset: Callable[[], None] = substate.reset  # untyped in Reflex
         reset()
+
+
+def _client_token() -> str:
+    """The Reflex client token of the event being processed."""
+    try:
+        return EventContext.get().token or ""
+    except LookupError:
+        return ""
 
 
 def _login_redirect(state: BaseState) -> StateUpdate:

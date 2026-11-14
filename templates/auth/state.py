@@ -38,8 +38,9 @@ def backend_url(path: str) -> str:
 
 
 def frontend_url(path: str) -> str:
-    base = (get_config().deploy_url or "").rstrip("/")
-    return base + path
+    """Absolute URL of a page. ``frontend_url`` is ``deploy_url`` when set,
+    else the dev server's ``http://localhost:<frontend_port>``."""
+    return get_config().frontend_url.rstrip("/") + path
 
 
 class AuthState(rx.State):

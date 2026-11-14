@@ -153,7 +153,11 @@ LinkOutcome = Literal[
     "admin_address",
     "blocked",
     "rate_limited",
+    "ip_flooding",
 ]
+
+LINK_REQUESTED = "auth.link_requested"
+LINK_FLOOD = "auth.link_flood"
 
 
 def request_link(
@@ -163,6 +167,15 @@ def request_link(
 
     Returns the plaintext token only when one was issued; it is never stored.
     """
+    if _audited(db, LINK_REQUESTED, client_ip) >= settings.LINK_REQUESTS_PER_IP:
+        # The form is public and every request below writes an audit row, so
+        # one client could grow that table without end. Past the limit a
+        # request is dropped before any other work, and noted once per window.
+        if not _audited(db, LINK_FLOOD, client_ip):
+            audit(db, LINK_FLOOD, client_ip=client_ip)
+            db.commit()
+        return None, "ip_flooding"
+
     email = security.normalize_email(raw_email)
     user = _user_for_email(db, email) if email else None
     outcome: LinkOutcome
@@ -180,16 +193,9 @@ def request_link(
     ):
         outcome = "rate_limited"
     else:
-        # Only one live link per address: requesting a new one kills the old.
-        db.exec(
-            update(AuthLinkToken)
-            .where(
-                col(AuthLinkToken.email) == email,
-                col(AuthLinkToken.used_at).is_(None),
-                col(AuthLinkToken.expires_at) > now(),
-            )
-            .values(expires_at=now())
-        )
+        # Earlier links stay valid. Expiring them here would let anyone who
+        # knows an address keep its owner from ever signing in, by requesting
+        # link after link. How many can be live is bounded by the rate limit.
         token = security.new_token()
         db.add(
             AuthLinkToken(
@@ -204,7 +210,7 @@ def request_link(
 
     audit(
         db,
-        "auth.link_requested",
+        LINK_REQUESTED,
         subject_user_id=user.id if user else None,
         email=email or raw_email,
         client_ip=client_ip,
@@ -214,8 +220,22 @@ def request_link(
     return token, outcome
 
 
+def _audited(db: Session, event: str, client_ip: str) -> int:
+    """How often ``event`` was audited for this IP in the rate window."""
+    query = (
+        select(func.count())
+        .select_from(AuthAuditEvent)
+        .where(
+            col(AuthAuditEvent.event) == event,
+            col(AuthAuditEvent.client_ip) == client_ip,
+            col(AuthAuditEvent.created_at) >= now() - settings.LINK_RATE_WINDOW,
+        )
+    )
+    return int(db.exec(query).one())
+
+
 def _recent_links(db: Session, *, email: str | None = None, client_ip: str | None = None) -> int:
-    since = now() - settings.LINK_EXPIRATION
+    since = now() - settings.LINK_RATE_WINDOW
     query = (
         select(func.count())
         .select_from(AuthLinkToken)
@@ -306,6 +326,12 @@ def admin_login(
     if settings.ADMIN_EMAIL is None or settings.ADMIN_PASSWORD_HASH is None:
         return None, "disabled"
 
+    # Failures are limited per client IP. The count over all IPs never locks
+    # anyone out by itself — twenty wrong guesses from anywhere would then
+    # lock the admin out, for free and as often as wanted. Reaching it means
+    # someone is guessing from many addresses: every IP is then allowed a
+    # single failure per window. With scrypt and a long password, one guess
+    # per address per window gets nowhere.
     since = now() - settings.ADMIN_LOCKOUT
     failures = (
         select(func.count())
@@ -314,10 +340,8 @@ def admin_login(
     )
     per_ip = int(db.exec(failures.where(col(AuthLoginAttempt.client_ip) == client_ip)).one())
     overall = int(db.exec(failures).one())
-    if (
-        per_ip >= settings.ADMIN_MAX_FAILURES_PER_IP
-        or overall >= settings.ADMIN_MAX_FAILURES_GLOBAL
-    ):
+    under_attack = overall >= settings.ADMIN_MAX_FAILURES_GLOBAL
+    if per_ip >= (1 if under_attack else settings.ADMIN_MAX_FAILURES_PER_IP):
         audit(db, "auth.admin_locked", client_ip=client_ip, detail=f"ip={per_ip} global={overall}")
         db.commit()
         return None, "locked"
@@ -331,6 +355,10 @@ def admin_login(
 
     db.add(AuthLoginAttempt(client_ip=client_ip, success=ok))
     if not ok:
+        if overall + 1 == settings.ADMIN_MAX_FAILURES_GLOBAL:  # once, on crossing it
+            audit(
+                db, "auth.admin_under_attack", client_ip=client_ip, detail=f"global={overall + 1}"
+            )
         audit(
             db, "auth.login_failed", email=raw_email, client_ip=client_ip, detail="admin_password"
         )
@@ -473,6 +501,41 @@ def merge_users(db: Session, source_id: int, target_id: int, *, actor_user_id: i
         detail=f"source={source_id} emails={len(moved)} sessions={revoked}",
     )
     db.commit()
+
+
+def delete_user(db: Session, user_id: int, new_owner_id: int, *, actor_user_id: int) -> None:
+    """Delete an account: ``merge_hooks.HAND_OVER_HOOKS`` give its app data to
+    ``new_owner_id``, then its addresses, sessions and links go. All in one
+    transaction; the audit log keeps the bare id."""
+    if user_id == actor_user_id:
+        raise AdminActionError("You cannot delete your own account.")
+    if user_id == new_owner_id:
+        raise AdminActionError("Pick another account as the new owner.")
+    user, owner = db.get(AuthUser, user_id), db.get(AuthUser, new_owner_id)
+    if user is None or owner is None:
+        raise AdminActionError("One of the accounts no longer exists.")
+    if _is_admin_account(db, user_id) or _is_admin_account(db, new_owner_id):
+        raise AdminActionError("The admin account cannot be deleted or take over data.")
+    if owner.blocked_at is not None:
+        raise AdminActionError("Unblock the new owner first.")
+
+    emails = list(db.exec(select(AuthUserEmail.email).where(AuthUserEmail.user_id == user_id)))
+    for hook in merge_hooks.HAND_OVER_HOOKS:
+        hook(db, user_id, new_owner_id)
+    db.exec(delete(AuthLinkToken).where(col(AuthLinkToken.email).in_(emails)))
+    ended = db.exec(delete(AuthSession).where(col(AuthSession.user_id) == user_id)).rowcount
+    db.exec(delete(AuthUserEmail).where(col(AuthUserEmail.user_id) == user_id))
+    db.flush()
+    db.delete(user)
+    audit(
+        db,
+        "admin.user_deleted",
+        actor_user_id=actor_user_id,
+        subject_user_id=user_id,
+        detail=f"new_owner={new_owner_id} emails={len(emails)} sessions={ended}",
+    )
+    db.commit()
+    log.info("user.delete", user_id=user_id, new_owner_id=new_owner_id)
 
 
 # --------------------------------------------------------------------------
@@ -633,3 +696,24 @@ def list_audit(db: Session, limit: int = 200) -> list[AuditRow]:
         for r in rows
         if r.id is not None
     ]
+
+
+@dataclasses.dataclass(frozen=True)
+class AdminCounts:
+    users: int
+    live_sessions: int
+    audit_last_week: int
+
+
+def admin_counts(db: Session) -> AdminCounts:
+    """The three numbers on the admin dashboard."""
+
+    def count(table: type, *where: ColumnElement[bool]) -> int:
+        return int(db.exec(select(func.count()).select_from(table).where(*where)).one())
+
+    week_ago = now() - timedelta(days=7)
+    return AdminCounts(
+        users=count(AuthUser),
+        live_sessions=count(AuthSession, *_live_session_filter()),
+        audit_last_week=count(AuthAuditEvent, col(AuthAuditEvent.created_at) >= week_ago),
+    )

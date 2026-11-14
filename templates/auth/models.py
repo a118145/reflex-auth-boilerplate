@@ -17,6 +17,7 @@ All timestamps are timezone-aware UTC. SQLite drops the zone on read, so
 from datetime import UTC, datetime
 
 from reflex.model import ModelRegistry
+from sqlalchemy import Index
 from sqlmodel import Field, SQLModel
 
 
@@ -93,6 +94,11 @@ class AuthAuditEvent(SQLModel, table=True):
     source account, and its history must survive that. Addresses that do not
     belong to an account are recorded only as a digest.
     """
+
+    # For the per-IP limit on link requests, which counts these rows.
+    __table_args__ = (
+        Index("ix_authauditevent_event_client_ip_created_at", "event", "client_ip", "created_at"),
+    )
 
     id: int | None = Field(default=None, primary_key=True)
     created_at: datetime = Field(default_factory=now, index=True)

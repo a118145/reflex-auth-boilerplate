@@ -1,0 +1,77 @@
+"""Merging and deleting people: what they own moves, what was granted to
+them moves on a merge and is dropped on a delete — and every column that
+holds a person says which of the two it is."""
+
+import pytest
+from sqlmodel import Session, SQLModel, select
+
+from {{app_name}} import service
+from {{app_name}}.auth.models import AUTH_TABLES
+from {{app_name}}.service import GroupMember, UserGroup, sharing
+
+from .conftest import ALICE, BOB, CAROL, PROBES, Probe, ProbeShare, probe
+
+
+def test_every_person_column_is_owner_or_grantee() -> None:
+    """A foreign key to ``authuser.id`` that neither list knows would be left
+    pointing at a deleted account. Add the column to ``OWNER_COLUMNS`` or
+    ``GRANTEE_COLUMNS`` in ``service/models.py`` (or make it a Shareable)."""
+    owner = {(m.__tablename__, c) for m, c in service.owner_columns()}
+    grantee = {(m.__tablename__, c) for m, c in service.grantee_columns()}
+    assert not owner & grantee
+    auth = {t.__name__.lower() for t in AUTH_TABLES}
+    found = {
+        (table.name, column.name)
+        for table in SQLModel.metadata.tables.values()
+        if table.name not in auth
+        for column in table.columns
+        if any(fk.target_fullname == "authuser.id" for fk in column.foreign_keys)
+    }
+    assert found == owner | grantee
+
+
+def _setup(db: Session) -> tuple[int, int, int]:
+    lab = service.create_group(db, BOB, "Lab").id or 0
+    for user in (BOB, CAROL):
+        service.add_member(db, CAROL, lab, user)
+    bobs, carols = probe(db, BOB, "Bobs"), probe(db, CAROL, "Carols")
+    sharing.share_with_user(db, PROBES, BOB, bobs, ALICE)
+    sharing.share_with_user(db, PROBES, CAROL, carols, BOB)
+    return lab, bobs, carols
+
+
+def test_merge_repoints_everything_without_duplicates(db: Session) -> None:
+    lab, bobs, carols = _setup(db)
+    service.add_member(db, CAROL, lab, ALICE)  # both accounts are members
+    sharing.share_with_user(db, PROBES, CAROL, carols, ALICE)  # and both have the share
+
+    service.merge_people(db, BOB, ALICE)
+    db.commit()
+    assert db.get(Probe, bobs).owner_id == ALICE  # type: ignore[union-attr]
+    assert db.get(UserGroup, lab).created_by == ALICE  # type: ignore[union-attr]
+    assert sorted(service.group_members(db, lab)) == [ALICE, CAROL]
+    # One share of Carol's probe; none of the probe Alice now owns.
+    shares = [(s.probe_id, s.user_id) for s in db.exec(select(ProbeShare)).all()]
+    assert shares == [(carols, ALICE)]
+    for model, column in service.owner_columns() + service.grantee_columns():
+        assert not db.exec(select(model).where(getattr(model, column) == BOB)).all()
+
+
+def test_hand_over_repoints_ownership_and_drops_grants(db: Session) -> None:
+    lab, bobs, _carols = _setup(db)
+
+    service.hand_over_person(db, BOB, ALICE)
+    db.commit()
+    assert db.get(Probe, bobs).owner_id == ALICE  # type: ignore[union-attr]
+    assert db.get(UserGroup, lab).created_by == ALICE  # type: ignore[union-attr]
+    # Bob's membership and share are gone, not given to Alice; Alice's share
+    # of the probe she now owns is gone too.
+    assert {m.user_id for m in db.exec(select(GroupMember)).all()} == {CAROL}
+    assert not db.exec(select(ProbeShare)).all()
+    for model, column in service.owner_columns() + service.grantee_columns():
+        assert not db.exec(select(model).where(getattr(model, column) == BOB)).all()
+
+
+def test_hand_over_to_oneself_is_refused(db: Session) -> None:
+    with pytest.raises(service.DomainError):
+        service.hand_over_person(db, BOB, BOB)

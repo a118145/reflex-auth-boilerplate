@@ -1,0 +1,273 @@
+"""Where an event comes from, checked against Reflex's real event processor.
+
+``auth.middleware.event_origin`` rests on how Reflex 0.11.0 hands events over:
+a socket event carries the handshake headers, an event a handler queues
+carries nothing and inherits its context, an upload carries nothing at all.
+These tests run events through ``app.event_processor`` — not a hand-built
+call to the middleware — so a Reflex upgrade that changes any of it fails
+here first.
+"""
+
+import asyncio
+import sys
+import uuid
+from collections.abc import Awaitable, Callable, Iterator
+from typing import Any
+
+import pytest
+import reflex as rx
+from reflex.event import Event
+from reflex.istate.manager.token import BaseStateToken
+from reflex.state import BaseState, OnLoadInternalState, State
+
+from {{app_name}} import {{app_name}} as app_module
+from {{app_name}}.auth import middleware, security, upload_gate
+from {{app_name}}.auth.cookie import COOKIE_NAME
+from {{app_name}}.auth.policy import auth_event
+from {{app_name}}.auth.service import Identity
+from {{app_name}}.auth.state import AuthState
+
+
+
+def _nobody(ctx: Any) -> bool:
+    return False
+
+
+class OriginProbeState(rx.State):
+    """An app state of the tests' own: a handler that queues another, and one
+    that leaves a trace. Not in the app package, so the policy tests skip it;
+    to the middleware it is an app state like any other."""
+
+    flag: bool = False
+    loads: int = 0
+
+    @rx.event
+    def load_all(self) -> Any:
+        return OriginProbeState.refresh
+
+    @rx.event
+    def refresh(self) -> None:
+        self.loads += 1
+
+    @rx.event
+    def set_flag(self, value: bool) -> None:
+        self.flag = value
+
+    # Awaiting a handler runs it inline, under the caller's event.
+    @rx.event
+    async def await_set_flag(self) -> None:
+        await OriginProbeState.set_flag(True)
+
+    @auth_event(auth=False)
+    async def public_await_set_flag(self) -> None:
+        await OriginProbeState.set_flag(True)
+
+    @auth_event(auth=_nobody)
+    def set_flag_nobody_may(self) -> None:
+        self.flag = True
+
+    @rx.event
+    async def await_nobody_may(self) -> None:
+        await OriginProbeState.set_flag_nobody_may()
+
+
+USER = Identity(session_id=1, user_id=7, email="anna@company.com", is_admin=False)
+SESSION = security.token_hash("user-token")
+# Reflex's client token: selects the state, proves nothing. A fresh one per
+# test (see ``fakes``) — the app's state manager outlives a test.
+CLIENT = ""
+PAGE_LOAD = f"{OnLoadInternalState.get_full_name()}.on_load_internal"
+LOAD_ALL = f"{OriginProbeState.get_full_name()}.load_all"  # returns .refresh
+REFRESH = f"{OriginProbeState.get_full_name()}.refresh"
+SET_FLAG = f"{OriginProbeState.get_full_name()}.set_flag"
+AWAIT_SET_FLAG = f"{OriginProbeState.get_full_name()}.await_set_flag"
+PUBLIC_AWAIT_SET_FLAG = f"{OriginProbeState.get_full_name()}.public_await_set_flag"
+NOBODY_MAY = f"{OriginProbeState.get_full_name()}.set_flag_nobody_may"
+AWAIT_NOBODY_MAY = f"{OriginProbeState.get_full_name()}.await_nobody_may"
+
+Seen = list[tuple[str, str]]
+Script = Callable[[Callable[[Event], Awaitable[None]]], Awaitable[None]]
+
+
+@pytest.fixture(autouse=True)
+def fakes(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    monkeypatch.setattr(middleware, "lookup_session", {SESSION: USER}.get)
+    monkeypatch.setattr(upload_gate, "_grants", {})
+    monkeypatch.setattr(sys.modules[__name__], "CLIENT", uuid.uuid4().hex)
+    yield
+
+
+def _socket_event(name: str, *, sid: str, signed_in: bool, **extra: Any) -> Event:
+    """An event as ``EventNamespace.on_event`` enqueues it: Reflex has put the
+    connection's headers and sid into the router data; ``extra`` stands for
+    keys the browser added itself."""
+    cookie = "theme=dark" + (f"; {COOKIE_NAME}=user-token" if signed_in else "")
+    router_data = {
+        "headers": {"cookie": cookie, "origin": "http://localhost:3000"},
+        "sid": sid,
+        "token": CLIENT,
+        "pathname": "/404",
+        "asPath": "/some/page",
+        "query": {},
+        **extra,
+    }
+    return Event(name=name, payload={}, router_data=router_data)
+
+
+def _drive(script: Script) -> tuple[Seen, BaseState]:
+    """Run ``script`` against the app's event processor. Returns the origin
+    the middleware saw for each event, and the root state afterwards."""
+    app = app_module.app
+    gate = app._middlewares[0]
+    seen: Seen = []
+    preprocess = gate.preprocess
+
+    async def spy(app: Any, state: Any, event: Event) -> Any:
+        seen.append((event.name, middleware.event_origin(event)))
+        return await preprocess(app=app, state=state, event=event)
+
+    async def main() -> BaseState:
+        async with app._setup_event_processor():
+
+            async def send(event: Event) -> None:
+                await asyncio.wait_for(await app.event_processor.enqueue(CLIENT, event), 10)
+                await app.event_processor.join(10)  # and everything it chained
+
+            await script(send)
+            token = BaseStateToken(ident=CLIENT, cls=State)
+            async with app.state_manager.modify_state(token) as root:
+                await root.get_state(AuthState)
+                await root.get_state(OriginProbeState)
+                return root
+
+    gate.preprocess = spy  # type: ignore[method-assign]
+    try:
+        with app.set_contexts():
+            root = asyncio.run(main())
+    finally:
+        gate.preprocess = preprocess  # type: ignore[method-assign]
+    return seen, root
+
+
+def _auth(root: BaseState) -> AuthState:
+    return asyncio.run(root.get_state(AuthState))
+
+
+def _probe(root: BaseState) -> OriginProbeState:
+    return asyncio.run(root.get_state(OriginProbeState))
+
+
+def test_socket_and_chained_events_are_told_apart() -> None:
+    async def script(send: Callable[[Event], Awaitable[None]]) -> None:
+        await send(_socket_event(LOAD_ALL, sid="A", signed_in=True))
+
+    seen, root = _drive(script)
+    assert seen == [(LOAD_ALL, "socket"), (REFRESH, "chained")]
+    # The chained event carried no cookie and did not sign anyone out.
+    assert _auth(root).is_authenticated
+
+
+def test_another_socket_without_the_cookie_cannot_keep_the_identity() -> None:
+    """The client token alone, plus a flag only this process may set, used to
+    be enough to stay signed in as the state's last user."""
+
+    async def script(send: Callable[[Event], Awaitable[None]]) -> None:
+        await send(_socket_event(PAGE_LOAD, sid="A", signed_in=True))
+        forged = {middleware._STRIPPED: True}
+        await send(_socket_event(PAGE_LOAD, sid="B", signed_in=False, **forged))
+        await send(_socket_event(SET_FLAG, sid="B", signed_in=False, **forged))
+
+    _seen, root = _drive(script)
+    assert not _auth(root).is_authenticated
+    assert _auth(root)._identity() is None
+    assert _probe(root).flag is False
+
+
+# --- Awaited handlers (Reflex 0.11): ``await State.handler()`` runs the
+# handler inline, under the caller's event. It passes the gate like any event.
+
+
+def _one(name: str, *, signed_in: bool) -> tuple[Seen, BaseState]:
+    async def script(send: Callable[[Event], Awaitable[None]]) -> None:
+        await send(_socket_event(name, sid="A", signed_in=signed_in))
+
+    return _drive(script)
+
+
+def test_an_awaited_handler_passes_the_gate_as_its_caller() -> None:
+    seen, root = _one(AWAIT_SET_FLAG, signed_in=True)
+    # It carries the caller's router data, cookie already taken out: the
+    # identity stands, and nobody is signed out by it.
+    assert seen == [(AWAIT_SET_FLAG, "socket"), (SET_FLAG, "socket")]
+    assert _auth(root).is_authenticated
+    assert _probe(root).flag is True
+
+
+def test_a_public_handler_cannot_await_its_way_past_the_login() -> None:
+    seen, root = _one(PUBLIC_AWAIT_SET_FLAG, signed_in=False)
+    assert [name for name, _ in seen] == [PUBLIC_AWAIT_SET_FLAG, SET_FLAG]
+    assert _probe(root).flag is False
+
+
+def test_an_awaited_handler_keeps_its_own_check() -> None:
+    seen, root = _one(AWAIT_NOBODY_MAY, signed_in=True)
+    assert [name for name, _ in seen] == [AWAIT_NOBODY_MAY, NOBODY_MAY]
+    assert _probe(root).flag is False
+
+
+def _detached(value: bool = True) -> Event:
+    """An event as ``POST /_upload`` builds it: no router data at all."""
+    return Event(name=SET_FLAG, payload={"value": value})
+
+
+def _sign_in_then_detached(send: Callable[[Event], Awaitable[None]]) -> Awaitable[None]:
+    async def run() -> None:
+        await send(_socket_event(PAGE_LOAD, sid="A", signed_in=True))
+        await send(_detached())
+
+    return run()
+
+
+def test_detached_event_needs_a_grant(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(upload_gate, "ENFORCED", True)
+    seen, root = _drive(_sign_in_then_detached)
+    assert seen[-1] == (SET_FLAG, "detached")
+    assert _probe(root).flag is False
+
+
+def test_detached_event_runs_with_a_grant_for_this_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(upload_gate, "ENFORCED", True)
+    upload_gate._open(CLIENT, SESSION)
+    _seen, root = _drive(_sign_in_then_detached)
+    assert _probe(root).flag is True
+
+
+def test_grant_for_another_session_does_not_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Someone signed in as themselves, uploading into another person's state.
+    monkeypatch.setattr(upload_gate, "ENFORCED", True)
+    upload_gate._open(CLIENT, security.token_hash("someone-else"))
+    _seen, root = _drive(_sign_in_then_detached)
+    assert _probe(root).flag is False
+
+
+def test_detached_event_passes_where_the_gate_cannot_be_enforced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Split origins (development): the upload request cannot carry the cookie.
+    monkeypatch.setattr(upload_gate, "ENFORCED", False)
+    _seen, root = _drive(_sign_in_then_detached)
+    assert _probe(root).flag is True
+
+
+def test_detached_event_never_signs_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(upload_gate, "ENFORCED", True)
+    upload_gate._open(CLIENT, SESSION)
+
+    async def script(send: Callable[[Event], Awaitable[None]]) -> None:
+        await send(_detached())
+
+    _seen, root = _drive(script)
+    assert not _auth(root).is_authenticated
+    assert _probe(root).flag is False

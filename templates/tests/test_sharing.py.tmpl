@@ -1,0 +1,118 @@
+"""Sharing: one owner; read through a share with the person, with a group
+they are in, or with everyone; only the owner shares; no admin bypass."""
+
+import pytest
+from sqlmodel import Session, select
+
+from {{app_name}} import service
+from {{app_name}}.service import sharing
+
+from .conftest import ALICE, BOB, CAROL, PROBES, Probe, ProbeGroupShare, ProbeShare, probe
+
+
+def _visible(db: Session, user: int) -> list[int]:
+    rows = db.exec(select(Probe).where(sharing.readable(PROBES, user))).all()
+    return sorted(p.id or 0 for p in rows)
+
+
+def test_only_the_owner_reads_until_it_is_shared(db: Session) -> None:
+    pid = probe(db, ALICE)
+    assert _visible(db, ALICE) == [pid]
+    assert _visible(db, BOB) == []
+    assert sharing.get_viewable(db, PROBES, ALICE, pid).id == pid
+    with pytest.raises(service.PermissionDeniedError):
+        sharing.get_viewable(db, PROBES, BOB, pid)
+
+
+def test_missing_and_not_yours_give_the_same_answer(db: Session) -> None:
+    pid = probe(db, ALICE)
+    refusals = []
+    for target in (pid, 999):
+        with pytest.raises(service.PermissionDeniedError) as refused:
+            sharing.get_viewable(db, PROBES, BOB, target)
+        refusals.append(str(refused.value))
+    assert refusals[0] == refusals[1]
+
+
+def test_share_with_a_person(db: Session) -> None:
+    pid = probe(db, ALICE)
+    with pytest.raises(service.PermissionDeniedError):
+        sharing.share_with_user(db, PROBES, BOB, pid, CAROL)  # only the owner shares
+    with pytest.raises(service.DomainError):
+        sharing.share_with_user(db, PROBES, ALICE, pid, ALICE)  # not with oneself
+    sharing.share_with_user(db, PROBES, ALICE, pid, BOB)
+    sharing.share_with_user(db, PROBES, ALICE, pid, BOB)  # once
+    assert sharing.user_shares_of(db, PROBES, pid) == [BOB]
+    assert sharing.shared_with_user(db, PROBES, BOB) == [pid]
+    assert _visible(db, BOB) == [pid] and _visible(db, CAROL) == []
+    # Reading is not owning.
+    with pytest.raises(service.PermissionDeniedError):
+        sharing.owned(db, PROBES, BOB, pid)
+    with pytest.raises(service.PermissionDeniedError):
+        sharing.unshare_user(db, PROBES, BOB, pid, BOB)
+    sharing.unshare_user(db, PROBES, ALICE, pid, BOB)
+    assert _visible(db, BOB) == []
+
+
+def test_share_with_a_group_covers_present_and_future_members(db: Session) -> None:
+    pid = probe(db, ALICE)
+    lab = service.create_group(db, CAROL, "Lab").id or 0
+    service.add_member(db, CAROL, lab, BOB)
+    with pytest.raises(service.PermissionDeniedError):
+        sharing.share_with_group(db, PROBES, BOB, pid, lab)
+    with pytest.raises(service.DomainError):
+        sharing.share_with_group(db, PROBES, ALICE, pid, 999)
+    sharing.share_with_group(db, PROBES, ALICE, pid, lab)
+    sharing.share_with_group(db, PROBES, ALICE, pid, lab)
+    assert sharing.group_shares_of(db, PROBES, pid) == [lab]
+    assert _visible(db, BOB) == [pid]
+    assert _visible(db, CAROL) == []  # made the group, is not in it: no bypass
+    service.add_member(db, CAROL, lab, CAROL)
+    assert _visible(db, CAROL) == [pid]
+    service.remove_member(db, CAROL, lab, BOB)
+    assert _visible(db, BOB) == []
+    sharing.unshare_group(db, PROBES, ALICE, pid, lab)
+    assert _visible(db, CAROL) == []
+
+
+def test_shared_with_everyone(db: Session) -> None:
+    pid = probe(db, ALICE)
+    with pytest.raises(service.PermissionDeniedError):
+        sharing.set_shared_with_all(db, PROBES, BOB, pid, True)
+    sharing.set_shared_with_all(db, PROBES, ALICE, pid, True)
+    assert _visible(db, BOB) == [pid]
+    assert sharing.can_view(db, PROBES, BOB, sharing.get_viewable(db, PROBES, BOB, pid))
+    sharing.set_shared_with_all(db, PROBES, ALICE, pid, False)
+    assert _visible(db, BOB) == []
+
+
+def test_only_the_owner_sees_who_else_has_access(db: Session) -> None:
+    pid = probe(db, ALICE)
+    lab = service.create_group(db, CAROL, "Lab").id or 0
+    sharing.share_with_user(db, PROBES, ALICE, pid, BOB)
+    sharing.share_with_group(db, PROBES, ALICE, pid, lab)
+    assert sharing.shares_of(db, PROBES, ALICE, pid) == sharing.Shares(False, [BOB], [lab])
+    with pytest.raises(service.PermissionDeniedError):
+        sharing.shares_of(db, PROBES, BOB, pid)
+
+
+def test_deleting_a_group_removes_its_shares_not_what_was_shared(db: Session) -> None:
+    pid = probe(db, ALICE)
+    lab = service.create_group(db, CAROL, "Lab").id or 0
+    keep = service.create_group(db, CAROL, "Keep").id or 0
+    sharing.share_with_group(db, PROBES, ALICE, pid, lab)
+    sharing.share_with_group(db, PROBES, ALICE, pid, keep)
+    service.delete_group(db, CAROL, lab)
+    assert sharing.group_shares_of(db, PROBES, pid) == [keep]
+    assert db.get(Probe, pid) is not None
+
+
+def test_deleting_the_thing_takes_its_shares_first(db: Session) -> None:
+    pid = probe(db, ALICE)
+    lab = service.create_group(db, CAROL, "Lab").id or 0
+    sharing.share_with_user(db, PROBES, ALICE, pid, BOB)
+    sharing.share_with_group(db, PROBES, ALICE, pid, lab)
+    sharing.drop_shares_of(db, PROBES, pid)
+    db.commit()
+    assert not db.exec(select(ProbeShare)).all()
+    assert not db.exec(select(ProbeGroupShare)).all()

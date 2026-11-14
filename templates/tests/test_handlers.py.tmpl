@@ -1,0 +1,188 @@
+"""``toast_errors`` and ``as_id``: the shared part of every event handler."""
+
+import asyncio
+import inspect
+import re
+from pathlib import Path
+from typing import Any
+
+import pytest
+import reflex as rx
+from reflex.event import EventSpec
+
+from {{app_name}} import service
+from {{app_name}}.auth.policy import AUTH_ATTR, auth_event, handler_policy
+from {{app_name}}.auth.service import AdminActionError
+from {{app_name}}.states.handlers import REFUSALS, TOAST_ATTR, toast_errors
+from {{app_name}}.utils.casting import InvalidInput, as_id
+
+
+def _is_error_toast(value: Any) -> bool:
+    text = str(value)
+    return isinstance(value, EventSpec) and "__toast" in text and '["error"]' in text
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        service.PermissionDeniedError("not yours"),
+        service.DomainError("already taken"),
+        AdminActionError("refused"),
+        InvalidInput("no such item"),
+    ],
+)
+def test_refusals_become_a_toast(error: Exception) -> None:
+    assert isinstance(error, REFUSALS)
+
+    @toast_errors
+    def plain(value: int) -> None:
+        raise error
+
+    @toast_errors
+    async def coroutine(value: int) -> None:
+        raise error
+
+    assert _is_error_toast(plain(1))
+    assert _is_error_toast(asyncio.run(coroutine(1)))
+
+
+def test_the_message_shown_is_the_refusal() -> None:
+    @toast_errors
+    def handler() -> None:
+        raise service.DomainError("The name is already taken.")
+
+    assert "The name is already taken." in str(handler())
+
+
+def test_everything_else_propagates() -> None:
+    @toast_errors
+    def plain() -> None:
+        raise ValueError("a bug")
+
+    @toast_errors
+    async def coroutine() -> None:
+        raise KeyError("a bug")
+
+    with pytest.raises(ValueError, match="a bug"):
+        plain()
+    with pytest.raises(KeyError):
+        asyncio.run(coroutine())
+
+
+def test_result_passes_through() -> None:
+    @toast_errors
+    def plain(a: int, b: int = 2) -> int:
+        return a + b
+
+    @toast_errors
+    async def coroutine(a: int) -> int:
+        return a * 2
+
+    assert plain(1) == 3
+    assert asyncio.run(coroutine(4)) == 8
+
+
+def test_generators_are_refused_at_definition() -> None:
+    with pytest.raises(TypeError, match="generator"):
+
+        @toast_errors
+        def handler() -> Any:
+            yield 1
+
+
+def test_wrapper_looks_like_the_handler_to_reflex() -> None:
+    def handler(self: Any, run_id: str, files: list[rx.UploadFile]) -> None: ...
+
+    async def task(self: Any, chunks: rx.UploadChunkIterator) -> None: ...
+
+    for fn in (handler, task):
+        wrapped = toast_errors(fn)
+        assert inspect.signature(wrapped) == inspect.signature(fn)
+        assert inspect.get_annotations(wrapped) == inspect.get_annotations(fn)
+        assert wrapped.__qualname__ == fn.__qualname__
+        assert inspect.iscoroutinefunction(wrapped) == inspect.iscoroutinefunction(fn)
+
+
+def test_works_under_the_event_decorators() -> None:
+    def never(ctx: Any) -> bool:
+        return False
+
+    class HandlerProbeState(rx.State):
+        seen: str = ""
+
+        @rx.event
+        @toast_errors
+        def plain(self, value: str) -> None:
+            self.seen = value
+
+        @auth_event(auth=never)
+        @toast_errors
+        async def gated(self, value: str) -> None:
+            self.seen = value
+
+        @rx.event(background=True)
+        @toast_errors
+        async def task(self, value: str) -> None:
+            async with self:
+                self.seen = value
+
+    handlers = HandlerProbeState.event_handlers
+    assert handlers["task"].is_background
+    assert handler_policy(handlers["gated"].fn) is never
+    assert getattr(handlers["plain"].fn, AUTH_ATTR, True) is True
+    # Reflex binds the event's argument by the handler's own parameter name.
+    spec = handlers["plain"]("x")
+    assert [str(name) for name, _ in spec.args] == ["value"]
+
+
+@pytest.mark.parametrize(("value", "expected"), [(7, 7), ("7", 7), (" 12 ", 12)])
+def test_as_id_accepts_positive_integers(value: object, expected: int) -> None:
+    assert as_id(value) == expected
+
+
+@pytest.mark.parametrize("value", [0, -1, "0", "", "abc", "1.5", "-3", None, True, 1.0, [1]])
+def test_as_id_refuses_everything_else(value: object) -> None:
+    with pytest.raises(InvalidInput):
+        as_id(value)
+
+
+# Called directly, or handed to ``call`` — both name a lower-case attribute.
+_REACHES_SERVICE = re.compile(r"\b(service|core|presets)\.[a-z_]+\b|\bas_id\(")
+
+
+def test_every_handler_that_calls_the_service_toasts_refusals() -> None:
+    """A handler that names the service or ``as_id`` carries ``toast_errors``
+    — a refusal must never surface as a backend exception."""
+    from {{app_name}} import {{app_name}}  # noqa: F401  (registers the states)
+    from {{app_name}}.auth.state import AuthState
+
+    bare: list[str] = []
+    pending = [AuthState.get_root_state()]
+    while pending:
+        cls = pending.pop()
+        pending.extend(cls.get_substates())
+        if not cls.__module__.startswith("{{app_name}}.states."):
+            continue
+        for name, handler in cls.event_handlers.items():
+            if name == "setvar":
+                continue
+            source = inspect.getsource(inspect.unwrap(handler.fn))
+            if _REACHES_SERVICE.search(source) and not getattr(handler.fn, TOAST_ATTR, False):
+                bare.append(f"{cls.__name__}.{name}")
+    assert bare == []
+
+
+def test_local_handling_of_refusals_says_why() -> None:
+    """A state catches a refusal itself only to restore or show something
+    first, and the first line of the ``except`` block says what."""
+    refusal = re.compile(
+        r"^\s*except .*(PermissionDeniedError|DomainError).*:$"
+    )
+    unexplained: list[str] = []
+    states = Path(__file__).parent.parent / "{{app_name}}" / "states"
+    for path in sorted(states.glob("*.py")):
+        lines = path.read_text().splitlines()
+        for number, line in enumerate(lines, start=1):
+            if refusal.match(line) and not lines[number].strip().startswith("#"):
+                unexplained.append(f"{path.name}:{number}")
+    assert unexplained == []

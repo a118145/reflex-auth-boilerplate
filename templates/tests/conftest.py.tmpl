@@ -1,0 +1,73 @@
+"""Shared fixtures: a throwaway database, and a shareable kind of the tests'
+own, so the sharing rules are exercised whatever kinds the app declares."""
+
+from collections.abc import Iterator
+from pathlib import Path
+
+import pytest
+from sqlalchemy import UniqueConstraint
+from sqlmodel import Field, Session, SQLModel, create_engine
+
+from {{app_name}}.auth import models as auth_models  # noqa: F401  (authuser, for the foreign keys)
+from {{app_name}}.service import sharing
+from {{app_name}}.service.sharing import Shareable
+
+ALICE, BOB, CAROL = 1, 2, 3
+
+
+class Probe(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    name: str
+    owner_id: int = Field(foreign_key="authuser.id", index=True)
+    shared_with_all: bool = False
+
+
+class ProbeShare(SQLModel, table=True):
+    __table_args__ = (UniqueConstraint("probe_id", "user_id"),)
+
+    id: int | None = Field(default=None, primary_key=True)
+    probe_id: int = Field(foreign_key="probe.id", index=True)
+    user_id: int = Field(foreign_key="authuser.id", index=True)
+
+
+class ProbeGroupShare(SQLModel, table=True):
+    __table_args__ = (UniqueConstraint("probe_id", "group_id"),)
+
+    id: int | None = Field(default=None, primary_key=True)
+    probe_id: int = Field(foreign_key="probe.id", index=True)
+    group_id: int = Field(foreign_key="usergroup.id", index=True)
+
+
+PROBES = Shareable(
+    kind="probe",
+    owner_word="owner",
+    model=Probe,
+    owner_column="owner_id",
+    user_share=ProbeShare,
+    group_share=ProbeGroupShare,
+    target_column="probe_id",
+)
+
+
+@pytest.fixture(autouse=True)
+def probe_kind(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sharing, "KINDS", (*sharing.KINDS, PROBES))
+
+
+@pytest.fixture
+def db(tmp_path: Path) -> Iterator[Session]:
+    # A database of the test's own, so creating every table is right here.
+    # SQLite does not enforce foreign keys by default: people are bare ids.
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        yield session
+    engine.dispose()
+
+
+def probe(db: Session, owner: int, name: str = "P") -> int:
+    item = Probe(name=name, owner_id=owner)
+    db.add(item)
+    db.commit()
+    db.refresh(item)
+    return item.id or 0

@@ -1,0 +1,53 @@
+"""User groups: unique names, members once per group, deleting a group
+takes its members with it."""
+
+import pytest
+from sqlmodel import Session, select
+
+from {{app_name}} import service
+from {{app_name}}.service import GroupMember, GroupRow, UserGroup
+
+from .conftest import ALICE, BOB
+
+ADMIN = 3
+
+
+def test_names_are_required_unique_and_trimmed(db: Session) -> None:
+    lab = service.create_group(db, ADMIN, "  Lab ")
+    assert (lab.name, lab.created_by) == ("Lab", ADMIN)
+    for name in ("", "   ", "Lab"):
+        with pytest.raises(service.DomainError):
+            service.create_group(db, ADMIN, name)
+    other = service.create_group(db, ADMIN, "Other")
+    with pytest.raises(service.DomainError):
+        service.rename_group(db, ADMIN, other.id or 0, "Lab")
+    service.rename_group(db, ADMIN, lab.id or 0, "Lab")  # its own name is fine
+    service.rename_group(db, ADMIN, lab.id or 0, "Bench")
+    assert [g.name for g in service.list_groups(db)] == ["Bench", "Other"]
+    assert [g.name for g in service.group_list(db)] == ["Bench", "Other"]
+
+
+def test_members_are_added_once_and_removed(db: Session) -> None:
+    lab = service.create_group(db, ADMIN, "Lab").id or 0
+    bench = service.create_group(db, ADMIN, "Bench").id or 0
+    for group, user in ((lab, ALICE), (lab, ALICE), (lab, BOB), (bench, ALICE)):
+        service.add_member(db, ADMIN, group, user)
+    assert sorted(service.group_members(db, lab)) == [ALICE, BOB]
+    assert sorted(service.groups_of_user(db, ALICE)) == sorted([lab, bench])
+    assert service.group_rows(db) == [GroupRow(bench, "Bench", 1), GroupRow(lab, "Lab", 2)]
+    service.remove_member(db, ADMIN, lab, ALICE)
+    assert service.group_members(db, lab) == [BOB]
+    with pytest.raises(service.DomainError):
+        service.add_member(db, ADMIN, 999, ALICE)
+
+
+def test_deleting_a_group_removes_its_members(db: Session) -> None:
+    lab = service.create_group(db, ADMIN, "Lab").id or 0
+    keep = service.create_group(db, ADMIN, "Keep").id or 0
+    service.add_member(db, ADMIN, lab, BOB)
+    service.add_member(db, ADMIN, keep, BOB)
+    service.delete_group(db, ADMIN, lab)
+    assert db.get(UserGroup, lab) is None
+    assert [(m.group_id, m.user_id) for m in db.exec(select(GroupMember)).all()] == [(keep, BOB)]
+    with pytest.raises(service.DomainError):
+        service.delete_group(db, ADMIN, lab)

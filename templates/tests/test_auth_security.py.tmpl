@@ -1,6 +1,11 @@
 """Pure helpers: redirect validation, client IP, password hashing, addresses."""
 
+import os
+import subprocess
+import sys
+
 import pytest
+from reflex.config import get_config
 
 from {{app_name}}.auth import security, settings
 
@@ -57,10 +62,10 @@ def test_password_hash_round_trip() -> None:
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
-        (" Anna@Firma.DE ", "anna@firma.de"),
-        ("anna@firma", None),
-        ("@firma.de", None),
-        ("an na@firma.de", None),
+        (" Anna@Company.COM ", "anna@company.com"),
+        ("anna@company", None),
+        ("@company.com", None),
+        ("an na@company.com", None),
         ("", None),
     ],
 )
@@ -69,7 +74,60 @@ def test_normalize_email(raw: str, expected: str | None) -> None:
 
 
 def test_domain_allowlist_is_exact(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "ALLOWED_DOMAINS", frozenset({"firma.de"}))
-    assert security.domain_allowed("anna@firma.de")
-    assert not security.domain_allowed("anna@sub.firma.de")
-    assert not security.domain_allowed("anna@firma.de.evil.test")
+    monkeypatch.setattr(settings, "ALLOWED_DOMAINS", frozenset({"company.com"}))
+    assert security.domain_allowed("anna@company.com")
+    assert not security.domain_allowed("anna@sub.company.com")
+    assert not security.domain_allowed("anna@company.com.evil.test")
+
+
+@pytest.mark.parametrize(
+    ("api_url", "deploy_url"),
+    [
+        ("https://app.example.org", "https://app.example.org"),
+        ("http://localhost:3000", "http://localhost:3000"),  # the image's own check
+        ("http://127.0.0.1:3000", "http://127.0.0.1:3000"),
+    ],
+)
+def test_public_urls_fit_for_production(api_url: str, deploy_url: str) -> None:
+    assert settings.public_url_problem(api_url, deploy_url) is None
+
+
+@pytest.mark.parametrize(
+    ("api_url", "deploy_url", "names"),
+    [
+        ("http://app.example.org", "https://app.example.org", "REFLEX_API_URL"),
+        ("https://app.example.org", "http://app.example.org", "REFLEX_DEPLOY_URL"),
+        ("https://api.example.org", "https://app.example.org", "same origin"),
+        ("http://localhost:8000", "http://localhost:3000", "same origin"),
+        ("https://app.example.org", None, "REFLEX_DEPLOY_URL"),
+        ("app.example.org", "https://app.example.org", "REFLEX_API_URL"),
+    ],
+)
+def test_public_urls_unfit_for_production(api_url: str, deploy_url: str | None, names: str) -> None:
+    problem = settings.public_url_problem(api_url, deploy_url)
+    assert problem is not None and names in problem
+
+
+def test_production_start_is_refused_on_plain_http() -> None:
+    # The check runs at import, like every other setting: a fresh interpreter.
+    env = {
+        **os.environ,
+        "REFLEX_ENV_MODE": "prod",
+        "REFLEX_API_URL": "http://app.example.org",
+        "REFLEX_DEPLOY_URL": "http://app.example.org",
+    }
+    code = "import {{app_name}}.auth.settings"
+    refused = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
+    assert refused.returncode != 0 and "must be https://" in refused.stderr
+    env |= {
+        "REFLEX_API_URL": "https://app.example.org",
+        "REFLEX_DEPLOY_URL": "https://app.example.org",
+    }
+    accepted = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
+    assert accepted.returncode == 0, accepted.stderr
+
+
+def test_backend_answers_only_its_own_origins() -> None:
+    origins = list(get_config().cors_allowed_origins)
+    assert origins and "*" not in origins
+    assert all(o.startswith(("http://", "https://")) and o.count("/") == 2 for o in origins)

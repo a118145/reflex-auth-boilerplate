@@ -4,7 +4,9 @@
         "route": routes.ADMIN_ROUTE,
         "admin_only": True,
         "sub_items": [
-            {"label": "Users", "icon": "users", "route": routes.ADMIN_ROUTE},
+            {"label": "Overview", "icon": "layout-dashboard", "route": routes.ADMIN_ROUTE},
+            {"label": "Users", "icon": "users", "route": routes.ADMIN_USERS_ROUTE},
+            {"label": "Groups", "icon": "users-round", "route": routes.ADMIN_GROUPS_ROUTE},
             {"label": "Sessions", "icon": "key-round", "route": routes.ADMIN_SESSIONS_ROUTE},
             {"label": "Audit log", "icon": "scroll-text", "route": routes.ADMIN_AUDIT_ROUTE},
         ],

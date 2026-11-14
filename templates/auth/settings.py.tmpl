@@ -5,34 +5,48 @@ instead of falling back to a default: these values bound how long a credential
 lives and how often one can be requested, so a typo must stop the app rather
 than quietly weaken it. An empty string means "not set".
 
-Defaults follow ``reflex-magic-link-auth`` (30 min links, 7 day sessions,
-5 links per window), which this implementation replaces.
+Session lifetime and link limits follow ``reflex-magic-link-auth`` (7 day
+sessions, 5 links per window), which this implementation replaces. Links
+live 15 minutes rather than its 30: the token is in the link's query string,
+so until it is spent it sits in the browser history and in any access log on
+the way.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | ``AUTH_ALLOWED_DOMAINS`` | — | Comma-separated e-mail domains that may request a link. Empty disables magic links. |
-| ``AUTH_LINK_EXPIRATION_SECONDS`` | 1800 | Lifetime of a link, and the rate-limit window. |
+| ``AUTH_LINK_EXPIRATION_SECONDS`` | 900 | Lifetime of a link. |
+| ``AUTH_LINK_RATE_WINDOW_SECONDS`` | 1800 | The window the link limits below count over. |
 | ``AUTH_SESSION_EXPIRATION_SECONDS`` | 604800 | Lifetime of a session. |
 | ``AUTH_LINK_RATE_LIMIT`` | 5 | Links per address per window. |
 | ``AUTH_LINK_RATE_LIMIT_PER_IP`` | 5 | Links per client IP per window. Raise it when many users share one IP (an office behind NAT). |
+| ``AUTH_LINK_REQUESTS_PER_IP`` | 30 | Link *requests* per client IP per window, whatever their outcome. Beyond it a request is dropped unseen: the form is public and every request is audited. |
 | ``AUTH_SESSION_RECHECK_SECONDS`` | 60 | How stale a session check may be before an event re-reads the database. |
 | ``ADMIN_EMAIL`` | — | The admin account. Signs in with a password only. |
 | ``ADMIN_PASSWORD_HASH`` | — | Output of ``python -m <app>.auth.hash_password``. |
 | ``AUTH_ADMIN_MAX_FAILURES_PER_IP`` | 5 | Failed admin logins per IP per lockout window. |
-| ``AUTH_ADMIN_MAX_FAILURES_GLOBAL`` | 20 | Failed admin logins in total per lockout window. |
+| ``AUTH_ADMIN_MAX_FAILURES_GLOBAL`` | 20 | Failed admin logins from all IPs per lockout window after which each IP is allowed only one failure. It never locks an IP that has not failed. |
 | ``AUTH_ADMIN_LOCKOUT_SECONDS`` | 900 | The lockout window. |
 | ``AUTH_PURGE_AFTER_DAYS`` | 30 | Used/expired links, ended sessions and login attempts older than this are deleted daily. The audit log is kept. |
 | ``AUTH_TRUSTED_PROXIES`` | — | Comma-separated proxy IPs whose ``X-Forwarded-For`` is believed. |
+| ``AUTH_ALLOW_NULL_ORIGIN`` | off | Set to ``1`` only behind a proxy that forces ``Referrer-Policy: no-referrer`` on plain HTTP, where browsers send ``Origin: null`` and no ``Sec-Fetch-Site``. Lets such form POSTs through; ``SameSite=Lax`` remains. |
 | ``MAIL_TRANSPORT`` | — | ``console`` (dev only), ``smtp``, ``mailgun`` or ``graph``. |
 | ``MAIL_FROM`` | — | Sender address (SMTP, Mailgun). Graph sends as ``GRAPH_SENDER``. |
 
 Transport-specific variables are documented in ``mail/``.
+
+Two Reflex settings are checked here as well, because the session cookie
+depends on them: in production (``REFLEX_ENV_MODE=prod``) ``REFLEX_API_URL``
+and ``REFLEX_DEPLOY_URL`` must be the same ``https://`` origin — see
+``public_url_problem``.
 """
 
 from __future__ import annotations
 
 import os
 from datetime import timedelta
+from urllib.parse import urlsplit
+
+from reflex.config import get_config
 
 APP_TITLE = "{{app_title}}"
 
@@ -71,10 +85,12 @@ def _domains() -> frozenset[str]:
 
 
 ALLOWED_DOMAINS = _domains()
-LINK_EXPIRATION = _seconds("AUTH_LINK_EXPIRATION_SECONDS", 1800)
+LINK_EXPIRATION = _seconds("AUTH_LINK_EXPIRATION_SECONDS", 900)
+LINK_RATE_WINDOW = _seconds("AUTH_LINK_RATE_WINDOW_SECONDS", 1800)
 SESSION_EXPIRATION = _seconds("AUTH_SESSION_EXPIRATION_SECONDS", 604800)
 LINK_RATE_LIMIT = _positive_int("AUTH_LINK_RATE_LIMIT", 5)
 LINK_RATE_LIMIT_PER_IP = _positive_int("AUTH_LINK_RATE_LIMIT_PER_IP", 5)
+LINK_REQUESTS_PER_IP = _positive_int("AUTH_LINK_REQUESTS_PER_IP", 30)
 SESSION_RECHECK = _seconds("AUTH_SESSION_RECHECK_SECONDS", 60)
 
 ADMIN_EMAIL = (_env("ADMIN_EMAIL") or "").lower() or None
@@ -92,6 +108,8 @@ PURGE_AFTER = timedelta(days=_positive_int("AUTH_PURGE_AFTER_DAYS", 30))
 
 TRUSTED_PROXIES = _csv("AUTH_TRUSTED_PROXIES")
 
+ALLOW_NULL_ORIGIN = _env("AUTH_ALLOW_NULL_ORIGIN") == "1"
+
 MAIL_TRANSPORT = (_env("MAIL_TRANSPORT") or "").lower() or None
 if MAIL_TRANSPORT not in (None, "console", "smtp", "mailgun", "graph"):
     raise ValueError(
@@ -102,3 +120,41 @@ if MAIL_TRANSPORT == "console" and os.environ.get("REFLEX_ENV_MODE", "dev") == "
         "MAIL_TRANSPORT=console writes sign-in links to the log; it is refused in prod."
     )
 MAIL_FROM = _env("MAIL_FROM")
+
+_LOOPBACK = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def public_url_problem(api_url: str, deploy_url: str | None) -> str | None:
+    """Why these URLs must not serve production, or ``None`` if they may.
+
+    * Both must be ``https://``: the cookie is ``Secure`` and ``__Host-``
+      prefixed only then (``cookie.py``), and a sign-in link over plain HTTP
+      is readable on the wire.
+    * Both must be one origin (``reflex run --single-port``): the browser
+      sends the cookie along with an upload only same-origin, so on split
+      origins ``upload_gate`` cannot check it.
+
+    Loopback hosts are exempt from the first rule — that is the image's own
+    health check and the local smoke tests, never a deployment.
+    """
+    urls = {"REFLEX_API_URL": api_url, "REFLEX_DEPLOY_URL": deploy_url or ""}
+    origins = set()
+    for name, url in urls.items():
+        parts = urlsplit(url)
+        if not parts.scheme or not parts.hostname:
+            return f"{name} must be an absolute URL, got {url!r}"
+        if parts.scheme != "https" and parts.hostname not in _LOOPBACK:
+            return f"{name} must be https:// in production, got {url!r}"
+        origins.add((parts.scheme, parts.netloc))
+    if len(origins) > 1:
+        return (
+            "REFLEX_API_URL and REFLEX_DEPLOY_URL must be the same origin in production "
+            f"(--single-port), got {api_url!r} and {deploy_url!r}"
+        )
+    return None
+
+
+if os.environ.get("REFLEX_ENV_MODE", "dev") == "prod" and (
+    _problem := public_url_problem(get_config().api_url, get_config().deploy_url)
+):
+    raise ValueError(_problem)

@@ -1,0 +1,20 @@
+import pytest
+from starlette.requests import Request
+
+from {{app_name}}.auth import origin, settings
+
+
+def _request(headers: dict[str, str]) -> Request:
+    raw = [(k.lower().encode(), v.encode()) for k, v in headers.items()]
+    return Request({"type": "http", "method": "POST", "headers": raw})
+
+
+def test_null_origin_refused_by_default() -> None:
+    assert not origin.from_this_app(_request({"origin": "null"}))
+
+
+def test_null_origin_accepted_only_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "ALLOW_NULL_ORIGIN", True)
+    assert origin.from_this_app(_request({"origin": "null"}))
+    # A browser that does send Sec-Fetch-Site still gets its verdict honoured.
+    assert not origin.from_this_app(_request({"origin": "null", "sec-fetch-site": "cross-site"}))
