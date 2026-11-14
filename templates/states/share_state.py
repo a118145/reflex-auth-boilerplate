@@ -103,7 +103,7 @@ class ShareState(rx.State):
         me = await actor_id(self)
         user_id = await call(user_by_email, self.share_email)
         if user_id is None:
-            return notify_error("Unknown address – the person must have signed in once.")
+            return notify_error("Unknown address: the person must have signed in once.")
         await call(sharing.share_with_user, what, me, target_id, user_id)
         log.info(f"{what.kind}.share", target_id=target_id, user_id=user_id)
         self.share_email = ""

@@ -19,7 +19,7 @@ def test_every_person_column_is_owner_or_grantee() -> None:
     owner = {(m.__tablename__, c) for m, c in service.owner_columns()}
     grantee = {(m.__tablename__, c) for m, c in service.grantee_columns()}
     assert not owner & grantee
-    auth = {t.__tablename__ for t in AUTH_TABLES}
+    auth = {t.__name__.lower() for t in AUTH_TABLES}
     found = {
         (table.name, column.name)
         for table in SQLModel.metadata.tables.values()

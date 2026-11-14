@@ -15,6 +15,7 @@ from collections.abc import Awaitable, Callable, Iterator
 from typing import Any
 
 import pytest
+import reflex as rx
 from reflex.event import Event
 from reflex.istate.manager.token import BaseStateToken
 from reflex.state import BaseState, OnLoadInternalState, State
@@ -24,8 +25,29 @@ from {{app_name}}.auth import middleware, security, upload_gate
 from {{app_name}}.auth.cookie import COOKIE_NAME
 from {{app_name}}.auth.service import Identity
 from {{app_name}}.auth.state import AuthState
-from {{app_name}}.states.runs_state import RunsState
-from {{app_name}}.states.upload_state import UploadState
+
+
+
+class OriginProbeState(rx.State):
+    """An app state of the tests' own: a handler that queues another, and one
+    that leaves a trace. Not in the app package, so the policy tests skip it;
+    to the middleware it is an app state like any other."""
+
+    flag: bool = False
+    loads: int = 0
+
+    @rx.event
+    def load_all(self) -> Any:
+        return OriginProbeState.refresh
+
+    @rx.event
+    def refresh(self) -> None:
+        self.loads += 1
+
+    @rx.event
+    def set_flag(self, value: bool) -> None:
+        self.flag = value
+
 
 USER = Identity(session_id=1, user_id=7, email="anna@company.com", is_admin=False)
 SESSION = security.token_hash("user-token")
@@ -33,9 +55,9 @@ SESSION = security.token_hash("user-token")
 # test (see ``fakes``) — the app's state manager outlives a test.
 CLIENT = ""
 PAGE_LOAD = f"{OnLoadInternalState.get_full_name()}.on_load_internal"
-LOAD_ALL = f"{RunsState.get_full_name()}.load_all"  # returns RunsState.refresh
-REFRESH = f"{RunsState.get_full_name()}.refresh"
-SET_SHARED = f"{UploadState.get_full_name()}.set_shared_with_all"
+LOAD_ALL = f"{OriginProbeState.get_full_name()}.load_all"  # returns .refresh
+REFRESH = f"{OriginProbeState.get_full_name()}.refresh"
+SET_FLAG = f"{OriginProbeState.get_full_name()}.set_flag"
 
 Seen = list[tuple[str, str]]
 Script = Callable[[Callable[[Event], Awaitable[None]]], Awaitable[None]]
@@ -44,8 +66,6 @@ Script = Callable[[Callable[[Event], Awaitable[None]]], Awaitable[None]]
 @pytest.fixture(autouse=True)
 def fakes(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setattr(middleware, "lookup_session", {SESSION: USER}.get)
-    # RunsState.refresh would read the database; what it loads is not the point.
-    monkeypatch.setattr("{{app_name}}.states.runs_state._load_rows", lambda owner, scope: [])
     monkeypatch.setattr(upload_gate, "_grants", {})
     monkeypatch.setattr(sys.modules[__name__], "CLIENT", uuid.uuid4().hex)
     yield
@@ -91,7 +111,7 @@ def _drive(script: Script) -> tuple[Seen, BaseState]:
             token = BaseStateToken(ident=CLIENT, cls=State)
             async with app.state_manager.modify_state(token) as root:
                 await root.get_state(AuthState)
-                await root.get_state(UploadState)
+                await root.get_state(OriginProbeState)
                 return root
 
     gate.preprocess = spy  # type: ignore[method-assign]
@@ -107,8 +127,8 @@ def _auth(root: BaseState) -> AuthState:
     return asyncio.run(root.get_state(AuthState))
 
 
-def _upload(root: BaseState) -> UploadState:
-    return asyncio.run(root.get_state(UploadState))
+def _probe(root: BaseState) -> OriginProbeState:
+    return asyncio.run(root.get_state(OriginProbeState))
 
 
 def test_socket_and_chained_events_are_told_apart() -> None:
@@ -129,17 +149,17 @@ def test_another_socket_without_the_cookie_cannot_keep_the_identity() -> None:
         await send(_socket_event(PAGE_LOAD, sid="A", signed_in=True))
         forged = {middleware._STRIPPED: True}
         await send(_socket_event(PAGE_LOAD, sid="B", signed_in=False, **forged))
-        await send(_socket_event(SET_SHARED, sid="B", signed_in=False, **forged))
+        await send(_socket_event(SET_FLAG, sid="B", signed_in=False, **forged))
 
     _seen, root = _drive(script)
     assert not _auth(root).is_authenticated
     assert _auth(root)._identity() is None
-    assert _upload(root).shared_with_all is False
+    assert _probe(root).flag is False
 
 
 def _detached(value: bool = True) -> Event:
     """An event as ``POST /_upload`` builds it: no router data at all."""
-    return Event(name=SET_SHARED, payload={"value": value})
+    return Event(name=SET_FLAG, payload={"value": value})
 
 
 def _sign_in_then_detached(send: Callable[[Event], Awaitable[None]]) -> Awaitable[None]:
@@ -153,8 +173,8 @@ def _sign_in_then_detached(send: Callable[[Event], Awaitable[None]]) -> Awaitabl
 def test_detached_event_needs_a_grant(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(upload_gate, "ENFORCED", True)
     seen, root = _drive(_sign_in_then_detached)
-    assert seen[-1] == (SET_SHARED, "detached")
-    assert _upload(root).shared_with_all is False
+    assert seen[-1] == (SET_FLAG, "detached")
+    assert _probe(root).flag is False
 
 
 def test_detached_event_runs_with_a_grant_for_this_session(
@@ -163,7 +183,7 @@ def test_detached_event_runs_with_a_grant_for_this_session(
     monkeypatch.setattr(upload_gate, "ENFORCED", True)
     upload_gate._open(CLIENT, SESSION)
     _seen, root = _drive(_sign_in_then_detached)
-    assert _upload(root).shared_with_all is True
+    assert _probe(root).flag is True
 
 
 def test_grant_for_another_session_does_not_count(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -171,7 +191,7 @@ def test_grant_for_another_session_does_not_count(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(upload_gate, "ENFORCED", True)
     upload_gate._open(CLIENT, security.token_hash("someone-else"))
     _seen, root = _drive(_sign_in_then_detached)
-    assert _upload(root).shared_with_all is False
+    assert _probe(root).flag is False
 
 
 def test_detached_event_passes_where_the_gate_cannot_be_enforced(
@@ -180,7 +200,7 @@ def test_detached_event_passes_where_the_gate_cannot_be_enforced(
     # Split origins (development): the upload request cannot carry the cookie.
     monkeypatch.setattr(upload_gate, "ENFORCED", False)
     _seen, root = _drive(_sign_in_then_detached)
-    assert _upload(root).shared_with_all is True
+    assert _probe(root).flag is True
 
 
 def test_detached_event_never_signs_in(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -192,4 +212,4 @@ def test_detached_event_never_signs_in(monkeypatch: pytest.MonkeyPatch) -> None:
 
     _seen, root = _drive(script)
     assert not _auth(root).is_authenticated
-    assert _upload(root).shared_with_all is False
+    assert _probe(root).flag is False
