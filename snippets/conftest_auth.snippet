@@ -1,16 +1,17 @@
-"""Shared fixtures: a throwaway database, and a shareable kind of the tests'
-own, so the sharing rules are exercised whatever kinds the app declares."""
 
-from collections.abc import Iterator
-from pathlib import Path
 
-import pytest
-from sqlalchemy import UniqueConstraint
-from sqlmodel import Field, Session, SQLModel, create_engine
+# --- reflex-auth-boilerplate: a throwaway database, and a shareable kind of
+# the tests' own, so the sharing rules are exercised whatever kinds the app
+# declares. Below the deprecation guard: these imports load the app.
+from collections.abc import Iterator  # noqa: E402
+from pathlib import Path  # noqa: E402
 
-from {{app_name}}.auth import models as auth_models  # noqa: F401  (authuser, for the foreign keys)
-from {{app_name}}.service import sharing
-from {{app_name}}.service.sharing import Shareable
+from sqlalchemy import UniqueConstraint  # noqa: E402
+from sqlmodel import Field, Session, SQLModel, create_engine  # noqa: E402
+
+from {{app_name}}.auth import models as auth_models  # noqa: E402, F401  (authuser, for the foreign keys)
+from {{app_name}}.service import sharing  # noqa: E402
+from {{app_name}}.service.sharing import Shareable  # noqa: E402
 
 ALICE, BOB, CAROL = 1, 2, 3
 
