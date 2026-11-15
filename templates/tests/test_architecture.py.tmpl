@@ -15,7 +15,6 @@ id, then delete its entry.
 import ast
 from pathlib import Path
 
-import pytest
 
 APP = Path(__file__).parent.parent / "{{app_name}}"
 SESSION_OPENERS = {"utils/db.py"}
@@ -105,19 +104,3 @@ def test_the_service_does_not_know_the_ui() -> None:
                 for alias in node.names:
                     assert alias.name.split(".")[0] != "reflex", path
 
-
-def test_a_reflex_deprecation_fails_the_tests() -> None:
-    """The guard in ``conftest.py``: Reflex only logs deprecations."""
-    from reflex_base.utils import console
-
-    from .conftest import REFLEX_DEPRECATIONS, ReflexDeprecationError
-
-    with pytest.raises(ReflexDeprecationError, match="probe"):
-        console.deprecate(
-            feature_name="probe",
-            reason="checks the guard",
-            deprecation_version="0",
-            removal_version="1",
-            dedupe=False,
-        )
-    REFLEX_DEPRECATIONS.remove(next(m for m in REFLEX_DEPRECATIONS if "probe" in m))

@@ -98,8 +98,9 @@ nothing the code already answers.**
 
 Also check, and stop to ask if any is true:
 
-- `auth/`, `service/`, `pages/login.py`, `ui/account.py`, `utils/db.py`,
-  `tests/conftest.py` or a `/login` route already exist.
+- `auth/`, `service/`, `pages/login.py`, `ui/account.py`, `utils/db.py`
+  or a `/login` route already exist, or `tests/conftest.py` already defines
+  `Probe` or `db` (the auth part was appended before).
 - **Reflex is not 0.11.0.** A fresh scaffold installs the newest release.
   Tell the user that the auth code is verified for 0.11.0 only and that
   Step 3 will pin it. An app on 0.10.x is upgraded by that pin (check its
@@ -169,6 +170,20 @@ Do **not** create `models/` for a database-less app: the auth tables live in
 Copy `templates/` into the app. `tests/*` go to the project's `tests/`,
 everything else into the `{{app_name}}/` package, keeping sub-paths. Strip
 `.tmpl` and fill placeholders. Never overwrite an existing file.
+
+Then the shared test setup. The auth tests need `tests/` to be a package
+and the scaffold's **deprecation guard** in `tests/conftest.py` (Reflex 0.11
+only logs deprecations; the guard fails the tests on them):
+
+- **Current scaffold apps** have `tests/__init__.py`, `tests/conftest.py`
+  (the guard) and `tests/test_deprecations.py`. Append
+  `snippets/conftest_auth.snippet` (`{{app_name}}` filled) to the end of
+  `tests/conftest.py` — below the guard, because its imports load the app.
+- **Apps from older scaffolds** have none of the three. Write them from
+  `snippets/scaffold_tests/` (`__init__.py.snippet`, `conftest.py.snippet`,
+  `test_deprecations.py.snippet` — copies of the scaffold's files), then
+  append `conftest_auth.snippet` as above. If only some exist, or
+  `conftest.py` has content without the guard, stop and ask.
 
 | Placeholder | Value |
 | --- | --- |
@@ -274,9 +289,11 @@ Apps from current scaffold versions bundle these in `scripts/check.sh --full`
 (every line must read `ok`) and have `scripts/smoke.sh` for the runtime check.
 
 The generated tests are the guards of the architecture — a red one names the
-rule that was broken; fix the code, not the test. `tests/conftest.py` brings
-a shareable kind of its own (`Probe`), so sharing, merge and delete are
-exercised before the app declares any kind.
+rule that was broken; fix the code, not the test. The auth part of
+`tests/conftest.py` brings a shareable kind of its own (`Probe`), so sharing,
+merge and delete are exercised before the app declares any kind. A Reflex
+deprecation anywhere fails the run (the scaffold's guard at the top of that
+file): fix the call, never the guard.
 
 ### Apps from older scaffold versions
 
@@ -285,15 +302,15 @@ exercised before the app declares any kind.
   `default_factory=datetime.now`. Fix: `lambda: datetime.now(UTC)`.
 - `tests/test_routes.py` imports `DECORATED_PAGES` from `reflex.page`:
   deprecated, and Reflex 0.11 only logs that, so it passed unnoticed. The
-  generated `tests/conftest.py` turns every Reflex deprecation into a test
-  failure, so this one now fails. Fix: read
+  deprecation guard written in Step 4a turns every Reflex deprecation into a
+  test failure, so this one now fails. Fix: read
   `RegistrationContext.ensure_context().decorated_pages` (from
   `reflex_base.registry`) instead, as the current scaffold does.
 - `utils/logging.py` without `logging.basicConfig(...)`: every `log.info`
   is dropped, including this skill's `auth.*` events (the audit table still
   records them). Fix: the current scaffold's `configure_logging`.
 
-Both are scaffold files, not auth files: **ask** before fixing them.
+These are scaffold files, not auth files: **ask** before fixing them.
 
 Then run it end to end:
 

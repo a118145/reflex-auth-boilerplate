@@ -37,10 +37,11 @@ its event, `api_transformer` wrapping Reflex's own routes, the native form.
 Reflex 0.11 reports a deprecated API as a record of the `reflex.deprecation`
 logger, once per call site and process — not as a Python warning. pytest
 shows neither, so a test can use a deprecated API and stay green (found:
-`reflex.page.DECORATED_PAGES` in the route and policy tests). The generated
-`tests/conftest.py` attaches a handler to that logger which raises at the
-call site and fails the session for any record a caller swallowed;
-`test_architecture.py` checks the guard. `reflex compile` prints them, which
+`reflex.page.DECORATED_PAGES` in the route and policy tests). The guard at
+the top of `tests/conftest.py` — from reflex-app-scaffold, or written by
+Step 4a for apps from older scaffolds — attaches a handler to that logger
+which raises at the call site and fails the session for any record a caller
+swallowed; `tests/test_deprecations.py` checks it. `reflex compile` prints them, which
 `scripts/check.sh --full` already fails on.
 
 The registry of `@rx.page` pages is
