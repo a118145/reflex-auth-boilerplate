@@ -1,6 +1,13 @@
 """Shared fixtures: a throwaway database, and a shareable kind of the tests'
-own, so the sharing rules are exercised whatever kinds the app declares."""
+own, so the sharing rules are exercised whatever kinds the app declares.
 
+Also: **a Reflex deprecation fails the tests.** Reflex (0.11) reports
+deprecations only as records of the ``reflex.deprecation`` logger, which
+pytest hides. Installed here, before the app is imported, so a deprecated
+API used at import time is caught too.
+"""
+
+import logging
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -8,9 +15,39 @@ import pytest
 from sqlalchemy import UniqueConstraint
 from sqlmodel import Field, Session, SQLModel, create_engine
 
-from {{app_name}}.auth import models as auth_models  # noqa: F401  (authuser, for the foreign keys)
-from {{app_name}}.service import sharing
-from {{app_name}}.service.sharing import Shareable
+
+
+class ReflexDeprecationError(Exception):
+    """A deprecated Reflex API was used. The message is Reflex's own."""
+
+
+# Every deprecation seen, also those a caller swallowed: checked at the end.
+REFLEX_DEPRECATIONS: list[str] = []
+
+
+class _FailOnDeprecation(logging.Handler):
+    def emit(self, record: logging.LogRecord) -> None:
+        message = record.getMessage()
+        REFLEX_DEPRECATIONS.append(message)
+        # Raised at the call site, so the failing test names the culprit.
+        raise ReflexDeprecationError(message)
+
+
+logging.getLogger("reflex.deprecation").addHandler(_FailOnDeprecation(logging.WARNING))
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    # Reflex reports each deprecation once per process; one raised where an
+    # exception is caught would otherwise pass unnoticed.
+    if REFLEX_DEPRECATIONS:
+        print("\nReflex deprecations:\n" + "\n".join(REFLEX_DEPRECATIONS))
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+
+
+# The app is imported only now, with the deprecation guard in place.
+from {{app_name}}.auth import models as auth_models  # noqa: E402, F401  (authuser, for the foreign keys)
+from {{app_name}}.service import sharing  # noqa: E402
+from {{app_name}}.service.sharing import Shareable  # noqa: E402
 
 ALICE, BOB, CAROL = 1, 2, 3
 

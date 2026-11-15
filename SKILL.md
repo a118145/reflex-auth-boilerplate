@@ -283,6 +283,12 @@ exercised before the app declares any kind.
 - `tests/test_persistence.py` fails with sqlmodel ≥ 0.0.48 ("Datetime values
   must have timezone information"): `models/item.py` has
   `default_factory=datetime.now`. Fix: `lambda: datetime.now(UTC)`.
+- `tests/test_routes.py` imports `DECORATED_PAGES` from `reflex.page`:
+  deprecated, and Reflex 0.11 only logs that, so it passed unnoticed. The
+  generated `tests/conftest.py` turns every Reflex deprecation into a test
+  failure, so this one now fails. Fix: read
+  `RegistrationContext.ensure_context().decorated_pages` (from
+  `reflex_base.registry`) instead, as the current scaffold does.
 - `utils/logging.py` without `logging.basicConfig(...)`: every `log.info`
   is dropped, including this skill's `auth.*` events (the audit table still
   records them). Fix: the current scaffold's `configure_logging`.
